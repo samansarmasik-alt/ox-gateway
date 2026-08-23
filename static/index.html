@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ox-gateway Dashboard</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',system-ui,sans-serif; }
+  body { background:#0b0e17; color:#e2e8f0; min-height:100vh; }
+  .wrap { max-width:1100px; margin:0 auto; padding:24px 16px 60px; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:24px;
+           padding:20px 24px; border-radius:16px;
+           background:linear-gradient(135deg,#131a2e 0%,#1a1440 100%);
+           border:1px solid #2a3354; }
+  header h1 { font-size:22px; letter-spacing:.5px; }
+  header h1 span { color:#8b7cf6; }
+  .badge-model { background:#8b7cf6; color:#0b0e17; font-weight:700; padding:6px 14px;
+                 border-radius:99px; font-size:13px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:24px; }
+  .card { background:#12182b; border:1px solid #232c4d; border-radius:14px; padding:16px; }
+  .card .lbl { font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#7c89ad; }
+  .card .val { font-size:26px; font-weight:700; margin-top:6px; }
+  .card .val.purple { color:#a78bfa; } .card .val.green { color:#34d399; }
+  .card .val.red { color:#f87171; } .card .val.blue { color:#60a5fa; }
+  section { background:#12182b; border:1px solid #232c4d; border-radius:16px;
+            padding:20px; margin-bottom:20px; }
+  section h2 { font-size:15px; text-transform:uppercase; letter-spacing:1px; color:#9aa7cc;
+               margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th { text-align:left; color:#7c89ad; font-weight:600; font-size:11px; text-transform:uppercase;
+       letter-spacing:1px; padding:8px 10px; border-bottom:1px solid #232c4d; }
+  td { padding:10px; border-bottom:1px solid #1a2140; vertical-align:middle; }
+  tr:hover td { background:#161d36; }
+  .mono { font-family:Consolas,monospace; font-size:12.5px; color:#93a4d1; word-break:break-all; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; }
+  .dot.active { background:#34d399; box-shadow:0 0 8px #34d39988; }
+  .dot.cooldown { background:#f59e0b; box-shadow:0 0 8px #f59e0b88; }
+  .state-active { color:#34d399; font-size:12px; } .state-cooldown { color:#f59e0b; font-size:12px; }
+  button { cursor:pointer; border:none; border-radius:9px; font-weight:600; font-size:13px; transition:.15s; }
+  .btn-add { background:#8b7cf6; color:#fff; padding:10px 18px; }
+  .btn-add:hover { background:#7566e8; }
+  .btn-del { background:#2a1830; color:#f87171; border:1px solid #4a2338; padding:5px 12px; font-size:12px; }
+  .btn-del:hover { background:#3d2033; }
+  .btn-run { background:#2563eb; color:#fff; padding:10px 18px; }
+  .btn-run:hover { background:#1d4fd7; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=text] { flex:1; background:#0b1020; border:1px solid #2a3354; color:#e2e8f0;
+                     border-radius:9px; padding:10px 14px; font-size:13.5px; outline:none;
+                     font-family:Consolas,monospace; min-width:0; }
+  input[type=text]:focus, textarea:focus { border-color:#8b7cf6; }
+  textarea { width:100%; background:#0b1020; border:1px solid #2a3354; color:#e2e8f0;
+             border-radius:9px; padding:10px 14px; font-size:13.5px; outline:none; resize:vertical;
+             font-family:inherit; }
+  .row { display:flex; gap:10px; align-items:center; }
+  label.f { display:block; font-size:11.5px; color:#7c89ad; text-transform:uppercase;
+            letter-spacing:1px; margin:12px 0 6px; }
+  code { color:#93a4d1; }
+</style>
+</head>
+
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>⚡ ox-<span>gateway</span> <small style="font-weight:400;color:#7c89ad;font-size:13px">— OpenRouter Key Pool</small></h1>
+    <div class="badge-model" id="model-badge">ox-alpha</div>
+  </header>
+
+  <div class="cards">
+    <div class="card"><div class="lbl">Toplam Key</div><div class="val purple" id="st-keys">–</div></div>
+    <div class="card"><div class="lbl">Aktif Key</div><div class="val green" id="st-active">–</div></div>
+    <div class="card"><div class="lbl">Toplam İstek</div><div class="val blue" id="st-req">–</div></div>
+    <div class="card"><div class="lbl">Başarısız</div><div class="val red" id="st-fail">–</div></div>
+    <div class="card"><div class="lbl">Uptime</div><div class="val" id="st-up">–</div></div>
+  </div>
+
+  <section>
+    <h2>🔌 Proxy Bağlantısı <span style="font-weight:400;text-transform:none;color:#66739a">(herhangi bir istemciye bunu ver)</span></h2>
+    <label class="f">Protokol &nbsp;(tek tuşla değişir, kalıcı kaydedilir)</label>
+    <div class="row">
+      <button id="proto-openai" class="btn-run" style="flex:1" onclick="setProtocol('openai')">🟢 OpenAI</button>
+      <button id="proto-anthropic" class="btn-del" style="flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354" onclick="setProtocol('anthropic')">🧠 Anthropic</button>
+    </div>
+    <label class="f">Model &nbsp;(varsayılan en üstte, sonra ücretsizler 🆓 — seçtiğin an kaydedilir)</label>
+    <select id="model-sel" onchange="setModel(this.value)" style="width:100%;background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;border-radius:9px;padding:10px 14px;font-size:13.5px;outline:none">
+      <option>yükleniyor…</option>
+    </select>
+    <label class="f" id="url-label">Anthropic Base URL &nbsp;(sabit — sadece bunu ver, "/v1" ekleme)</label>
+    <div class="row">
+      <input type="text" id="conn-url" readonly value="" />
+      <button class="btn-run" style="background:#33406e" onclick="copyText(document.getElementById('conn-url').value)">Kopyala</button>
+    </div>
+    <label class="f">API Key &nbsp;(sabit — sadece "Yeni Üret" dersen değişir)</label>
+    <div class="row">
+      <input type="text" id="conn-key" readonly value="" />
+      <button class="btn-run" style="background:#33406e" onclick="copyText(document.getElementById('conn-key').value)">Kopyala</button>
+      <button class="btn-del" onclick="rotateKey()">🔄 Yeni Üret</button>
+    </div>
+    <p class="hint" id="proto-hint"></p>
+  </section>
+
+  <section>
+    <h2>🔑 API Key Havuzu</h2>
+    <div class="row">
+      <textarea id="new-key" rows="2" placeholder="OpenRouter key'lerini yapıştır — birden fazlaysa alt alta veya virgülle ayır" style="flex:1"></textarea>
+      <button class="btn-add" onclick="addKey()">+ Ekle</button>
+    </div>
+    <p class="hint">Eklediğin keyler <b>Fernet ile şifrelenip</b> <code>%APPDATA%\ox-gateway</code> altında saklanır — proje klasöründe asla düz metin durmaz, GitHub'a da itilmez.</p>
+    <table style="margin-top:14px">
+      <thead><tr>
+        <th>Durum</th><th>Key</th><th>İstek</th><th>✓ / ✗</th>
+        <th>Son Süre</th><th>Ort. Süre</th><th>Cooldown</th><th></th>
+      </tr></thead>
+      <tbody id="key-rows"><tr><td colspan="8" style="color:#66739a">yükleniyor…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>💬 Hızlı Chat Testi</h2>
+    <textarea id="chat-in" rows="2" placeholder="ox-alpha'ya göndermek istediğin mesajı yaz…"></textarea>
+    <div style="margin-top:10px;display:flex;justify-content:flex-end">
+      <button class="btn-run" id="chat-btn" onclick="sendChat()">Gönder ▸</button>
+    </div>
+    <div class="out" id="chat-out">Cevap burada görünecek…</div>
+  </section>
+
+  <section>
+    <h2>🤖 Paralel Sub-Agent Çalıştırıcı</h2>
+    <label class="f">Her satır bir agent &nbsp;→&nbsp; format: <code>rol | görev</code></label>
+    <textarea id="agents-in" rows="5">Şair | Yapay zeka hakkında 2 satır şiir yaz
+Matematikçi | 17 * 23 kaç?
+Çevirmen | 'hello world' ü Türkçeye çevir</textarea>
+    <div style="margin-top:10px;display:flex;justify-content:flex-end">
+      <button class="btn-run" id="par-btn" onclick="runAgents()">Paralel Çalıştır ⚡</button>
+    </div>
+    <div class="agent-grid" id="par-out"></div>
+  </section>
+
+</div>
+<div class="toast" id="toast"></div>
+<style>
+  .out { background:#0b1020; border:1px solid #232c4d; border-radius:10px; padding:14px;
+         font-size:13.5px; white-space:pre-wrap; line-height:1.55; margin-top:12px;
+         min-height:44px; max-height:340px; overflow-y:auto; color:#cbd5f0; }
+  .hint { font-size:12px; color:#66739a; margin-top:8px; }
+  .agent-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+                gap:12px; margin-top:14px; }
+  .agent-card { background:#0b1020; border:1px solid #232c4d; border-radius:12px;
+                padding:14px; font-size:13px; }
+  .agent-card h4 { font-size:12px; margin-bottom:8px; word-break:break-all; color:#93a4d1; }
+  .agent-card.ok h4 { color:#34d399; } .agent-card.err h4 { color:#f87171; }
+  .agent-card .body { color:#cbd5f0; white-space:pre-wrap; line-height:1.5;
+                      max-height:220px; overflow-y:auto; }
+  .toast { position:fixed; bottom:22px; right:22px; background:#1c2542;
+           border:1px solid #33406e; padding:12px 20px; border-radius:11px;
+           font-size:13.5px; opacity:0; transition:.3s; pointer-events:none; z-index:50; }
+  .toast.show { opacity:1; }
+</style>
+<script>
+const API = "";
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+async function jfetch(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    let msg = r.status;
+    try { const j = await r.json(); msg = j.detail || JSON.stringify(j); } catch {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+function fmtUptime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  return (h ? h+"sa " : "") + (m ? m+"dk " : "") + sec + "sn";
+}
+
+async function refresh() {
+  try {
+    const d = await jfetch(API + "/api/stats");
+    document.getElementById("st-keys").textContent = d.total_keys;
+    document.getElementById("st-active").textContent = d.active_keys;
+    document.getElementById("st-req").textContent = d.total_requests;
+    document.getElementById("st-fail").textContent = d.total_fail;
+    document.getElementById("st-up").textContent = fmtUptime(d.uptime_s);
+    document.getElementById("model-badge").textContent = d.model;
+
+    const rows = document.getElementById("key-rows");
+    if (!d.keys.length) {
+      rows.innerHTML = '<tr><td colspan="8" style="color:#66739a">Henüz key yok — yukarıdan ekle.</td></tr>';
+      return;
+    }
+    rows.innerHTML = d.keys.map(k => `
+      <tr>
+        <td><span class="dot ${k.state}"></span><span class="state-${k.state}">${k.state === "active" ? "Aktif" : "Bekliyor"}</span></td>
+        <td class="mono">${k.key}</td>
+        <td>${k.requests}</td>
+        <td><span style="color:#34d399">${k.ok}</span> / <span style="color:#f87171">${k.fail}</span></td>
+        <td class="mono">${k.last_ms != null ? k.last_ms + " ms" : "–"}</td>
+        <td class="mono">${k.avg_ms != null ? k.avg_ms + " ms" : "–"}</td>
+        <td>${k.cooldown_remaining > 0 ? Math.ceil(k.cooldown_remaining) + " sn" : "–"}</td>
+        <td><button class="btn-del" onclick="delKey('${k.full}')">Sil</button></td>
+      </tr>`).join("");
+  } catch (e) { /* sunucu kapaliysa sessiz gec */ }
+}
+
+async function addKey() {
+  const inp = document.getElementById("new-key");
+  const raw = inp.value.replace(/,/g, "\n");
+  const keys = [...new Set(raw.split("\n").map(k => k.trim()).filter(k => k.length > 10))];
+  if (!keys.length) return toast("Önce key yapıştır 🙂");
+  let added = 0;
+  try {
+    for (const key of keys) {
+      const d = await jfetch(API + "/keys/add", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key})
+      });
+      if (d.added) added++;
+    }
+    inp.value = "";
+    toast(`${added} key eklendi ✔ (${keys.length - added} tanesi zaten vardı)`);
+    refresh();
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => toast("Panoya kopyalandı ✔"));
+}
+
+async function loadModels() {
+  try {
+    const d = await jfetch(API + "/api/models");
+    const sel = document.getElementById("model-sel");
+    sel.innerHTML = d.models.map(m => {
+      const badge = m.default ? "" : (m.free ? "🆓 " : "");
+      const label = m.default ? m.name : `${badge}${m.name} · ${m.id}`;
+      return `<option value="${m.id}">${label}</option>`;
+    }).join("");
+    sel.value = d.default;
+  } catch {}
+}
+
+async function setModel(model) {
+  try {
+    await jfetch(API + "/model/set", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({model})
+    });
+    document.getElementById("model-badge").textContent = model;
+    toast("Varsayılan model: " + model);
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+let CURRENT_PROTO = "openai";
+
+function renderProto(proto) {
+  CURRENT_PROTO = proto;
+  const btnO = document.getElementById("proto-openai");
+  const btnA = document.getElementById("proto-anthropic");
+  const onO = proto === "openai";
+  btnO.className = onO ? "btn-run" : "btn-del";
+  btnO.style.cssText = onO ? "flex:1" : "flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354";
+  btnA.className = !onO ? "btn-run" : "btn-del";
+  btnA.style.cssText = !onO ? "flex:1" : "flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354";
+
+  const urlInp = document.getElementById("conn-url");
+  urlInp.value = onO ? "http://127.0.0.1:8756/v1" : "http://127.0.0.1:8756";
+  document.getElementById("url-label").innerHTML =
+    (onO ? "OpenAI Base URL" : "Anthropic Base URL") + " &nbsp;(sabit)";
+  document.getElementById("proto-hint").innerHTML = onO
+    ? 'Örnek: <code>OpenAI(base_url="...", api_key="...")</code> → endpoint <code>/v1/chat/completions</code> · model: <b>' +
+      document.getElementById("model-badge").textContent + '</b>'
+    : 'Claude Code / Anthropic SDK: base_url olarak <b>sadece</b> <code>http://127.0.0.1:8756</code> ver ("/v1" ekleme). SDK kendisi <code>/v1/messages</code> ekler. api_key header\'da <code>x-api-key</code> olarak gider. · model: <b>' +
+      document.getElementById("model-badge").textContent + '</b>';
+}
+
+async function setProtocol(proto) {
+  try {
+    await jfetch(API + "/protocol/set", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({protocol: proto})
+    });
+    renderProto(proto);
+    toast("Protokol: " + (proto === "openai" ? "🟢 OpenAI" : "🧠 Anthropic"));
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+async function loadConn() {
+  try {
+    const d = await jfetch(API + "/api/conn");
+    document.getElementById("conn-key").value = d.gateway_api_key;
+    document.getElementById("conn-model").textContent = d.model;
+    renderProto(d.protocol || "openai");
+  } catch {}
+}
+
+async function rotateKey() {
+  if (!confirm("Gateway API key yenilenecek. Eski key kullanan tüm istemciler bağlantıyı kaybeder. Emin misin?")) return;
+  try {
+    const d = await jfetch(API + "/api/rotate", {method: "POST"});
+    document.getElementById("conn-key").value = d.gateway_api_key;
+    toast("Yeni API key üretildi ✔");
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+async function delKey(key) {
+  try {
+    const d = await jfetch(API + "/keys/remove", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key})
+    });
+    toast(d.removed ? `Key silindi (kalan ${d.total})` : "Key bulunamadı");
+    refresh();
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+async function sendChat() {
+  const msg = document.getElementById("chat-in").value.trim();
+  if (!msg) return;
+  const out = document.getElementById("chat-out");
+  const btn = document.getElementById("chat-btn");
+  btn.disabled = true;
+  out.textContent = "";
+  const gk = document.getElementById("conn-key").value;
+  const model = document.getElementById("model-sel").value || "ox-alpha";
+  try {
+    let reader, dec = new TextDecoder(), buf = "";
+    if (CURRENT_PROTO === "anthropic") {
+      // ---- Anthropic /v1/messages ----
+      const r = await fetch(API + "/v1/messages", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "x-api-key": gk,
+                  "anthropic-version": "2023-06-01"},
+        body: JSON.stringify({model, max_tokens: 2048, stream: true,
+                              messages: [{role: "user", content: msg}]})
+      });
+      if (!r.ok) throw new Error((await r.text()).slice(0, 200));
+      reader = r.body.getReader();
+      let evName = "";
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream: true});
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (line.startsWith("event: ")) { evName = line.slice(7).trim(); continue; }
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const j = JSON.parse(line.slice(6));
+            if (evName === "content_block_delta" && j.delta && j.delta.text) {
+              out.textContent += j.delta.text;
+              out.scrollTop = out.scrollHeight;
+            }
+          } catch {}
+        }
+      }
+    } else {
+      // ---- OpenAI /v1/chat/completions ----
+      const r = await fetch(API + "/v1/chat/completions", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "Authorization": "Bearer " + gk},
+        body: JSON.stringify({model, messages: [{role: "user", content: msg}], stream: true})
+      });
+      if (!r.ok) throw new Error((await r.text()).slice(0, 200));
+      reader = r.body.getReader();
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream: true});
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const part = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of part.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const j = JSON.parse(data);
+              const d = j.choices && j.choices[0] && j.choices[0].delta;
+              if (d && (d.content || d.reasoning)) {
+                out.textContent += d.content || d.reasoning || "";
+                out.scrollTop = out.scrollHeight;
+              }
+            } catch {}
+          }
+        }
+      }
+    }
+  } catch (e) { out.textContent = "❌ Hata: " + e.message; }
+  btn.disabled = false;
+  refresh();
+}
+
+async function runAgents() {
+  const lines = document.getElementById("agents-in").value.split("\n")
+    .map(l => l.trim()).filter(Boolean)
+    .map(l => {
+      const parts = l.split("|");
+      return {system: parts[0].trim(), task: parts.slice(1).join("|").trim()};
+    })
+    .filter(a => a.task);
+  if (!lines.length) return toast("En az bir 'rol | görev' satırı gerek");
+
+  const grid = document.getElementById("par-out");
+  const btn = document.getElementById("par-btn");
+  btn.disabled = true;
+  grid.innerHTML = lines.map((a, i) =>
+    `<div class="agent-card" id="ag-${i}"><h4>🤖 Agent ${i+1}: ${a.system}</h4><div class="body">çalışıyor…</div></div>`
+  ).join("");
+  try {
+    const d = await jfetch(API + "/agent/parallel", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({agents: lines})
+    });
+    d.results.forEach(r => {
+      const el = document.getElementById("ag-" + r.index);
+      el.className = "agent-card " + (r.ok ? "ok" : "err");
+      el.querySelector(".body").textContent = r.ok ? r.output : ("❌ " + r.error);
+    });
+  } catch (e) {
+    grid.innerHTML = `<div class="agent-card err"><h4>Hata</h4><div class="body">${e.message}</div></div>`;
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+loadConn();
+loadModels();
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

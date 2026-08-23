@@ -1,0 +1,12 @@
+{
+  "model": "ox-alpha",
+  "pace_ms": 100,
+  "first_token_ms": 20000,
+  "stall_timeout": 45,
+  "api_keys": [],
+  "request_timeout": 120,
+  "cooldown_seconds": 30,
+  "cooldown_every": 3,
+  "rest_seconds": 8,
+  "max_retries": 3
+}
