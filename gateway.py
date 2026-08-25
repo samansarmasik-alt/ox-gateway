@@ -575,9 +575,10 @@ async def anthropic_messages(request: Request):
 
         async def sse_anthropic():
             client, resp, line_iter, first_line = await open_stream(payload, model)
-            # thinking ve text icin AYRI bloklar: 0=thinking, 1=text
-            block_type: str | None = None   # None | "thinking" | "text"
+            # thinking ve text icin AYRI bloklar; her tool_call da kendi blogunda
+            block_type: str | None = None   # None | "thinking" | "text" | "tool_use"
             block_index = -1
+            cur_tool = None                 # su an akilan upstream tool kimligi (id/index)
             stop_reason = "end_turn"
             usage_out = 0
             msg_id = "msg_" + str(int(time.time() * 1000))
@@ -591,9 +592,9 @@ async def anthropic_messages(request: Request):
                 },
             })
 
-            async def emit_block(kind: str, delta_txt: str, tool_name: str = "", tool_id: str = ""):
+            async def emit_block(kind: str, delta_txt: str, tool_name: str = "", tool_id: str = "", force: bool = False):
                 nonlocal block_type, block_index
-                if block_type != kind:
+                if block_type != kind or force:
                     if block_type is not None:
                         yield _sse_event("content_block_stop", {
                             "type": "content_block_stop", "index": block_index})
@@ -651,13 +652,22 @@ async def anthropic_messages(request: Request):
                             if ct:
                                 async for chunk in emit_block("text", ct):
                                     yield chunk
-                            # tool_calls stream: yeni blok ac, argumanlari parca parca ak
-                            for tc in d.get("tool_calls") or []:
+                            # tool_calls stream: HER cagri ayri blok (kimlik: id/index),
+                            # yoksa argumanlar tek bloga yapisip JSON bozuluyor
+                            for ti, tc in enumerate(d.get("tool_calls") or []):
                                 fn = tc.get("function", {})
+                                tkey = str(tc.get("id") or tc.get("index", ti))
                                 if fn.get("name"):
-                                    async for chunk in emit_block("tool_use", "", tool_name=fn["name"], tool_id=tc.get("id", "")):
+                                    force_new = (tkey != cur_tool) or (block_type != "tool_use")
+                                    async for chunk in emit_block(
+                                        "tool_use", "",
+                                        tool_name=fn["name"],
+                                        tool_id=tc.get("id", ""),
+                                        force=force_new,
+                                    ):
                                         yield chunk
-                                if fn.get("arguments"):
+                                    cur_tool = tkey
+                                if fn.get("arguments") and block_type == "tool_use":
                                     yield _sse_event("content_block_delta", {
                                         "type": "content_block_delta", "index": block_index,
                                         "delta": {"type": "input_json_delta",
