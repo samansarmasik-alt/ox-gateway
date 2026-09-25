@@ -1274,33 +1274,89 @@ async def keys_status(mode: str | None = None):
 # --------------------------------------------------------------------------
 # Anthropic Messages API uyumlulugu (/v1/messages)
 # --------------------------------------------------------------------------
+def _block_text(b: dict) -> str:
+    """tool_result icerigini duz metne cevirir (liste veya string)."""
+    rc = b.get("content", "")
+    if isinstance(rc, list):
+        parts = []
+        for x in rc:
+            if isinstance(x, dict):
+                parts.append(x.get("text", "") or "")
+            else:
+                parts.append(str(x))
+        return "\n".join(p for p in parts if p)
+    return str(rc or "")
+
+
 def _anthropic_to_openai(body: dict) -> dict:
-    """Anthropic istek formatini OpenAI formatina cevirir."""
+    """Anthropic istek formatini OpenAI formatina cevirir.
+
+    tool_use / tool_result DONUSUMU ONEMLI:
+      - assistant icindeki tool_use bloklari OpenAI tool_calls mesajina cevrilir
+      - user icindeki tool_result bloklari role:"tool" + tool_call_id mesajina cevrilir
+    Onceki surumde bunlar atiliyordu / sahte metne donusturuluyordu; boylece
+    model ilk tool cagrisindan sonra konusma gecmisini kaybediyor, tek turluk
+    calisiyor ve cok turlu agent akisinda anlatima kaciyordu."""
     msgs: list[dict] = []
     sys = body.get("system")
     if sys:
         if isinstance(sys, list):
             sys = " ".join(b.get("text", "") for b in sys if isinstance(b, dict))
         msgs.append({"role": "system", "content": sys})
+
     for m in body.get("messages", []):
+        role = m.get("role", "user")
         c = m.get("content")
-        if isinstance(c, list):
-            parts: list[str] = []
-            for b in c:
-                if not isinstance(b, dict):
-                    continue
-                t = b.get("type")
-                if t == "text":
-                    parts.append(b.get("text", ""))
-                elif t == "tool_result":
-                    rc = b.get("content", "")
-                    if isinstance(rc, list):
-                        rc = " ".join(x.get("text", "") for x in rc if isinstance(x, dict))
-                    parts.append(f"[tool_result] {rc}")
-                elif t == "thinking":
-                    parts.append(b.get("thinking", ""))
-            c = "\n".join(parts)
-        msgs.append({"role": m.get("role", "user"), "content": c or ""})
+
+        if not isinstance(c, list):
+            msgs.append({"role": role, "content": c if c is not None else ""})
+            continue
+
+        texts: list[str] = []
+        thinking: list[str] = []
+        tool_calls: list[dict] = []
+        tool_results: list[tuple[str, str]] = []
+
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text":
+                if b.get("text"):
+                    texts.append(b["text"])
+            elif t == "thinking":
+                if b.get("thinking"):
+                    thinking.append(b["thinking"])
+            elif t == "tool_use":
+                try:
+                    args = json.dumps(b.get("input", {}), ensure_ascii=False)
+                except (TypeError, ValueError):
+                    args = "{}"
+                tool_calls.append({
+                    "id": b.get("id", ""),
+                    "type": "function",
+                    "function": {"name": b.get("name", ""), "arguments": args},
+                })
+            elif t == "tool_result":
+                tool_results.append((b.get("tool_use_id", ""), _block_text(b)))
+
+        # tool_result'lar ONCE gonderilir: OpenAI sirasi tool sonucu -> asistan
+        if tool_results:
+            for tid, txt in tool_results:
+                msgs.append({"role": "tool", "tool_call_id": tid, "content": txt})
+        if texts or tool_calls:
+            # tool_calls her zaman assistant'a ait; OpenAI role:"user" + tool_calls kabul etmez
+            assistant: dict = {"role": "assistant" if tool_calls else (role or "user"),
+                               "content": "\n".join(texts) or None}
+            if tool_calls:
+                assistant["tool_calls"] = tool_calls
+            msgs.append(assistant)
+        elif tool_results:
+            pass  # sadece tool_result vardi, yukarida eklendi
+        elif thinking:
+            # thinking-only tur: reasoning olarak koru, icerik uretmeden bos mesaj atma
+            msgs.append({"role": role, "content": ""})
+
     out: dict = {"messages": msgs, "max_tokens": body.get("max_tokens") or 1024}
     if body.get("temperature") is not None:
         out["temperature"] = body["temperature"]
@@ -1318,6 +1374,16 @@ def _anthropic_to_openai(body: dict) -> dict:
             }
             for t in tools if isinstance(t, dict) and t.get("name")
         ]
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        kind = tc.get("type")
+        if kind == "any":
+            out["tool_choice"] = "required"
+        elif kind == "tool" and tc.get("name"):
+            out["tool_choice"] = {"type": "function",
+                                  "function": {"name": tc["name"]}}
+        elif kind in ("auto", "none"):
+            out["tool_choice"] = kind
     return out
 
 
