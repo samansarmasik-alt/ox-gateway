@@ -42,7 +42,7 @@ client = OpenAI(
     api_key="<dashboard'daki gateway api key>",
 )
 resp = client.chat.completions.create(
-    model="ox-alpha",
+    model="Atria-Dawn-Preview",
     messages=[{"role": "user", "content": "selam"}],
     stream=True,  # opsiyonel
 )
@@ -57,7 +57,7 @@ ANTHROPIC_API_KEY=<gateway api key>
 from anthropic import Anthropic
 
 client = Anthropic(base_url="http://127.0.0.1:8756", api_key="<gateway api key>")
-msg = client.messages.create(model="ox-alpha", max_tokens=1024,
+msg = client.messages.create(model="Atria-Dawn-Preview", max_tokens=1024,
                              messages=[{"role": "user", "content": "selam"}])
 ```
 
@@ -82,8 +82,9 @@ Dashboard'daki **🟢 OpenAI / 🧠 Anthropic** düğmeleriyle aktif protokolü 
 | `POST /v1/messages` · `POST /messages` | Anthropic Messages API (stream + tool_use) |
 | `POST /agent/run` · `/agent/parallel` | Sub-agent çalıştırıcı |
 | `GET /api/stats` · `/api/conn` · `/api/models` | Dashboard verileri |
-| `POST /keys/add` · `/keys/remove` | Canlı key yönetimi (kalıcı) |
-| `POST /model/set` · `/protocol/set` · `/api/rotate` | Model / protokol / api key yenileme |
+| `POST /keys/add` · `/keys/remove` | Canlı key yönetimi (kalıcı, `mode` ile mod seçilir) |
+| `POST /model/set` · `/protocol/set` · `/api/rotate` | Model (mod bazında) / protokol / api key yenileme |
+| `POST /mode/set` · `/provider/set` · `GET /api/providers` | Provider/mod seçimi (`1` = Atria, `2` = OpenRouter) |
 
 > `/v1/*` endpoint'leri gateway api key ister; dashboard ve yönetim endpoint'leri localhost'ta açıktır.
 
@@ -91,15 +92,20 @@ Dashboard'daki **🟢 OpenAI / 🧠 Anthropic** düğmeleriyle aktif protokolü 
 
 | Anahtar | Varsayılan | Açıklama |
 |---|---|---|
-| `model` | `ox-alpha` | Varsayılan model (dashboard'dan değişir) |
+| `model` | `Atria-Dawn-Preview` | Varsayılan model (dashboard'dan, mod bazında değişir) |
+| `active_mode` | `1` | Aktif provider: `1` = Atria, `2` = OpenRouter |
+| `provider_models` | — | Mod başına varsayılan model (`{"1": ..., "2": ...}`) |
 | `pace_ms` | 100 | İstekler arası bekleme — **en fazla bu kadar** |
 | `first_token_ms` | 20000 | İlk token gelmezse key cooldown'a girer, failover |
 | `stall_timeout` | 45 | Stream ortasında ver kesilirse akış kapatılır |
 | `request_timeout` | 120 | Okuma timeout'u (sn); connect 10 sn |
-| `cooldown_seconds` | 30 | Hatalı key bekleme süresi |
+| `cooldown_seconds` | 3 | Hatalı key bekleme süresi (max 3 sn) |
 | `cooldown_every` | 3 | Her key bu kadar istekte bir dinlenmeye girer |
-| `rest_seconds` | 8 | Dinlenme süresi |
+| `rest_seconds` | 3 | Dinlenme süresi (max 3 sn) |
 | `max_retries` | 3 | Failover'da denenecek farklı key sayısı |
+| `heal_retries` | 2 | Zincir tükenince tüm zincir kaç kez daha denenir |
+| `graceful_degradation` | true | Her şey tükenirse agent'e hata yerine geçerli cevap döner |
+| `auto_model_fallback` | true | 429'da otomatik yedek ücretsiz modele geç |
 
 ## 🔐 Güvenlik
 
@@ -124,4 +130,4 @@ py -3 test_claude_code.py # Claude Code akış simülasyonu
 
 ---
 
-*ox-alpha ve OpenRouter topluluğu için ❤️ ile yapıldı.*
+*Atria + OpenRouter topluluğu için ❤️ ile yapıldı.*

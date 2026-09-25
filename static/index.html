@@ -63,7 +63,7 @@
 
   <header>
     <h1>⚡ ox-<span>gateway</span> <small style="font-weight:400;color:#7c89ad;font-size:13px">— OpenRouter Key Pool</small></h1>
-    <div class="badge-model" id="model-badge">ox-alpha</div>
+    <div class="badge-model" id="model-badge">Atria-Dawn-Preview</div>
   </header>
 
   <div class="cards">
@@ -81,6 +81,12 @@
       <button id="proto-openai" class="btn-run" style="flex:1" onclick="setProtocol('openai')">🟢 OpenAI</button>
       <button id="proto-anthropic" class="btn-del" style="flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354" onclick="setProtocol('anthropic')">🧠 Anthropic</button>
     </div>
+    <label class="f">Provider / Mod &nbsp;(1 = Atria, 2 = OpenRouter — her modun key havuzu ayrı)</label>
+    <div class="row">
+      <button id="mode-1" class="btn-run" style="flex:1" onclick="setMode('1')">1️⃣ Mod 1 · Atria</button>
+      <button id="mode-2" class="btn-del" style="flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354" onclick="setMode('2')">2️⃣ Mod 2 · OpenRouter</button>
+    </div>
+    <p class="hint" id="provider-hint"></p>
     <label class="f">Model &nbsp;(varsayılan en üstte, sonra ücretsizler 🆓 — seçtiğin an kaydedilir)</label>
     <select id="model-sel" onchange="setModel(this.value)" style="width:100%;background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;border-radius:9px;padding:10px 14px;font-size:13.5px;outline:none">
       <option>yükleniyor…</option>
@@ -100,9 +106,17 @@
   </section>
 
   <section>
-    <h2>🔑 API Key Havuzu</h2>
+    <h2>🔑 API Key Havuzu <span id="pool-label" style="font-weight:400;text-transform:none;color:#66739a"></span></h2>
+    <div class="row" style="margin-bottom:10px">
+      <label class="f" style="margin:0">Hedef mod:</label>
+      <select id="key-mode" style="background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;border-radius:9px;padding:8px 12px;font-size:13px;outline:none">
+        <option value="active">Aktif moda ekle</option>
+        <option value="1">1️⃣ Mod 1 · Atria</option>
+        <option value="2">2️⃣ Mod 2 · OpenRouter</option>
+      </select>
+    </div>
     <div class="row">
-      <textarea id="new-key" rows="2" placeholder="OpenRouter key'lerini yapıştır — birden fazlaysa alt alta veya virgülle ayır" style="flex:1"></textarea>
+      <textarea id="new-key" rows="2" placeholder="Key'leri yapıştır — birden fazlaysa alt alta veya virgülle ayır (hedef moddaki havuza gider)" style="flex:1"></textarea>
       <button class="btn-add" onclick="addKey()">+ Ekle</button>
     </div>
     <p class="hint">Eklediğin keyler <b>Fernet ile şifrelenip</b> <code>%APPDATA%\ox-gateway</code> altında saklanır — proje klasöründe asla düz metin durmaz, GitHub'a da itilmez.</p>
@@ -117,7 +131,7 @@
 
   <section>
     <h2>💬 Hızlı Chat Testi</h2>
-    <textarea id="chat-in" rows="2" placeholder="ox-alpha'ya göndermek istediğin mesajı yaz…"></textarea>
+    <textarea id="chat-in" rows="2" placeholder="Aktif moddaki modele göndermek istediğin mesajı yaz…"></textarea>
     <div style="margin-top:10px;display:flex;justify-content:flex-end">
       <button class="btn-run" id="chat-btn" onclick="sendChat()">Gönder ▸</button>
     </div>
@@ -181,6 +195,37 @@ function fmtUptime(s) {
   return (h ? h+"sa " : "") + (m ? m+"dk " : "") + sec + "sn";
 }
 
+let CURRENT_MODE = "1";
+
+function renderMode(mode, provider, url) {
+  CURRENT_MODE = mode;
+  const b1 = document.getElementById("mode-1");
+  const b2 = document.getElementById("mode-2");
+  const on1 = mode === "1";
+  if (b1 && b2) {
+    b1.className = on1 ? "btn-run" : "btn-del";
+    b1.style.cssText = on1 ? "flex:1" : "flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354";
+    b2.className = !on1 ? "btn-run" : "btn-del";
+    b2.style.cssText = !on1 ? "flex:1" : "flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354";
+  }
+  const hint = document.getElementById("provider-hint");
+  if (hint && provider) hint.innerHTML = `Aktif: <b>Mod ${mode} · ${provider}</b> → <code>${url || ""}</code>`;
+  const pl = document.getElementById("pool-label");
+  if (pl && provider) pl.textContent = `— Mod ${mode} · ${provider}`;
+}
+
+async function setMode(mode) {
+  try {
+    const d = await jfetch(API + "/mode/set", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mode})
+    });
+    renderMode(d.active_mode, d.provider, d.provider_url);
+    toast(`Mod ${d.active_mode} · ${d.provider} ✔`);
+    loadModels(); refresh(); loadConn();
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
 async function refresh() {
   try {
     const d = await jfetch(API + "/api/stats");
@@ -190,6 +235,7 @@ async function refresh() {
     document.getElementById("st-fail").textContent = d.total_fail;
     document.getElementById("st-up").textContent = fmtUptime(d.uptime_s);
     document.getElementById("model-badge").textContent = d.model;
+    if (d.active_mode) renderMode(d.active_mode, d.provider, d.provider_url);
 
     const rows = document.getElementById("key-rows");
     if (!d.keys.length) {
@@ -216,11 +262,14 @@ async function addKey() {
   const keys = [...new Set(raw.split("\n").map(k => k.trim()).filter(k => k.length > 10))];
   if (!keys.length) return toast("Önce key yapıştır 🙂");
   let added = 0;
+  const sel = document.getElementById("key-mode");
+  const target = (sel && sel.value !== "active") ? sel.value : null;
   try {
     for (const key of keys) {
+      const payload = target ? {key, mode: target} : {key};
       const d = await jfetch(API + "/keys/add", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({key})
+        body: JSON.stringify(payload)
       });
       if (d.added) added++;
     }
@@ -249,12 +298,12 @@ async function loadModels() {
 
 async function setModel(model) {
   try {
-    await jfetch(API + "/model/set", {
+    const d = await jfetch(API + "/model/set", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({model})
+      body: JSON.stringify({model, mode: CURRENT_MODE})
     });
-    document.getElementById("model-badge").textContent = model;
-    toast("Varsayılan model: " + model);
+    document.getElementById("model-badge").textContent = d.model;
+    toast(`Mod ${d.mode} modeli: ` + d.model);
   } catch (e) { toast("Hata: " + e.message); }
 }
 
@@ -296,8 +345,8 @@ async function loadConn() {
   try {
     const d = await jfetch(API + "/api/conn");
     document.getElementById("conn-key").value = d.gateway_api_key;
-    document.getElementById("conn-model").textContent = d.model;
     renderProto(d.protocol || "openai");
+    if (d.active_mode) renderMode(d.active_mode, d.provider, d.provider_url);
   } catch {}
 }
 
@@ -314,7 +363,7 @@ async function delKey(key) {
   try {
     const d = await jfetch(API + "/keys/remove", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({key})
+      body: JSON.stringify({key, mode: CURRENT_MODE})
     });
     toast(d.removed ? `Key silindi (kalan ${d.total})` : "Key bulunamadı");
     refresh();
@@ -329,7 +378,7 @@ async function sendChat() {
   btn.disabled = true;
   out.textContent = "";
   const gk = document.getElementById("conn-key").value;
-  const model = document.getElementById("model-sel").value || "ox-alpha";
+  const model = document.getElementById("model-sel").value || "Atria-Dawn-Preview";
   try {
     let reader, dec = new TextDecoder(), buf = "";
     if (CURRENT_PROTO === "anthropic") {
