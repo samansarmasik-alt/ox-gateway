@@ -519,6 +519,74 @@ def _atria_headers(key: str) -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# Kirpilmis (truncated) tur tespiti + max_tokens tirmanmasi
+#
+# Bazi upstream modeller (stealth/space-bunny-alpha, Atria) tum token
+# bütcesini reasoning'e harcir ve max_tokens dolduğunda tool_call URETMEDEN
+# kesilir: content=None, finish_reason="length". Istemci (Claude Code, agent)
+# bos bir tur gorup "is bitti" sanir ve durur. Gateway bunu yakalayip
+# max_tokens'i katlayarak ayni istegi tekrar gonderir.
+# --------------------------------------------------------------------------
+def _openai_turn_is_empty(result: dict) -> bool:
+    """OpenAI formatinda cevap metin ve tool_call icermiyorsa kirpilmistir."""
+    try:
+        msg = result["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return False
+    has_text = bool((msg.get("content") or "").strip())
+    has_tool = bool(msg.get("tool_calls"))
+    has_reasoning = bool((msg.get("reasoning") or "").strip())
+    truncated = result["choices"][0].get("finish_reason") == "length"
+    return truncated and not has_text and not has_tool and has_reasoning
+
+
+def _anthropic_turn_is_empty(anth: dict) -> bool:
+    """Anthropic formatinda cevap sadece thinking iceriyor ve kirpilmis ise True."""
+    if anth.get("stop_reason") != "max_tokens":
+        return False
+    for b in anth.get("content") or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text" and (b.get("text") or "").strip():
+            return False
+        if b.get("type") == "tool_use":
+            return False
+    return True
+
+
+def _next_token_budget(current: int | None) -> int:
+    """Kirpilmada max_tokens'i kademeli artirir (katli, tavanda)."""
+    floor = int(CONFIG.get("min_token_budget", 1024))
+    cap = int(CONFIG.get("max_token_budget", 32768))
+    step = max(512, int(CONFIG.get("token_budget_step", 2048)))
+    base = int(current or 0)
+    nxt = max(base * 2, base + step, floor)
+    return min(nxt, cap)
+
+
+def _token_budget_tries() -> int:
+    return max(1, int(CONFIG.get("token_budget_tries", 3)))
+
+
+def _apply_budget_floor(payload: dict) -> dict:
+    """Streaming icin token butce tabani: reasoning + tool_call bir arada sigsin.
+
+    Istemci cok kucuk max_tokens isteyince model butceyi reasoning'e harcar,
+    tool_call uretmeden kesilir ve agent bos tur gorup durur."""
+    floor = int(CONFIG.get("min_token_budget", 1024))
+    cur = int(payload.get("max_tokens") or 0)
+    if 0 < cur < floor:
+        payload = {**payload, "max_tokens": floor}
+    return payload
+
+
+async def _await_truncation_retry(delay: float = 0.4):
+    """Kisa bekleyip tur bitim noktasindan devam edilecek sinyal uretir."""
+    await asyncio.sleep(delay)
+
+
+
 async def _candidate_models(model: str | None) -> list[str]:
     """Birincil model + 429 durumunda denenecek ucretsiz yedek modeller.
     Yedekler once config'deki 'fallback_models'dan, sonra OpenRouter'un
@@ -609,7 +677,10 @@ def _openai_graceful_chunks() -> list[bytes]:
 
 
 async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> dict:
-    """Anthropic-format istegi 1. mod havuzuyla Atria'ya yollar (failover'li)."""
+    """Anthropic-format istegi 1. mod havuzuyla Atria'ya yollar (failover'li).
+
+    Cevap kirpilirsa (sadece thinking + stop_reason=max_tokens) max_tokens
+    katlanarak tekrar denenir; boylece tool_call uretilir."""
     primary = model or get_active_model()
     pool = POOLS["1"]
     body = dict(anth_payload)
@@ -619,6 +690,7 @@ async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> 
     max_retries = CONFIG.get("max_retries", 3)
     rounds = max(1, int(CONFIG.get("heal_retries", 2)))
     last_err = None
+    budget_tries = _token_budget_tries()
     for rnd in range(rounds):
         tried: set[str] = set()
         for _ in range(max_retries):
@@ -633,9 +705,17 @@ async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> 
                     resp = await client.post(ATRIA_URL, json=body, headers=_atria_headers(key))
                 ms = (time.perf_counter() - t0) * 1000
                 if resp.status_code == 200:
+                    data = resp.json()
                     pool.mark_ok(key)
                     pool.record(key, ms, ok=True)
-                    return resp.json()
+                    if _anthropic_turn_is_empty(data) and budget_tries > 0:
+                        budget_tries -= 1
+                        old = int(body.get("max_tokens") or 0)
+                        body["max_tokens"] = _next_token_budget(old)
+                        print(f"[ox-gateway] atria cevabi kirpildi (max_tokens={old}, "
+                              f"tool_call yok) -> {body['max_tokens']} ile tekrar deneniyor")
+                        continue
+                    return data
                 last_err = f"atria:{primary} -> HTTP {resp.status_code}: {resp.text[:300]}"
                 _handle_upstream_failure(key, resp, ms, pool)
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
@@ -666,6 +746,7 @@ async def open_atria_stream(anth_payload: dict, model: str | None = None):
     body["model"] = primary
     if not body.get("max_tokens"):
         body["max_tokens"] = 1024
+    body = _apply_budget_floor(body)
     body["stream"] = True
     max_retries = CONFIG.get("max_retries", 3)
     first_token_s = max(1.0, float(CONFIG.get("first_token_ms", 20000)) / 1000.0)
@@ -737,53 +818,79 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
     max_retries = CONFIG.get("max_retries", 3)
     rounds = max(1, int(CONFIG.get("heal_retries", 2)))
     variants = _payload_variants(base_payload)
+    budget_tries = _token_budget_tries()
     last_err = None
 
     for rnd in range(rounds):
         for vbase in variants:
             for m in await _candidate_models(primary):
-                payload_m = {**vbase, "model": m}
-                tried: set[str] = set()
-                bad_payload = False
-                for _ in range(max_retries):
-                    key = await pool.acquire(skip=tried)
-                    if key is None:
-                        break
-                    tried.add(key)
-                    await THROTTLE.wait()
-                    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-                    t0 = time.perf_counter()
-                    try:
-                        async with httpx.AsyncClient(timeout=_timeouts()) as client:
-                            resp = await client.post(OPENROUTER_URL, json=payload_m, headers=headers)
-                        ms = (time.perf_counter() - t0) * 1000
-                        if resp.status_code == 200:
-                            pool.mark_ok(key)
-                            pool.record(key, ms, ok=True)
-                            if m != primary or vbase is not variants[0]:
-                                print(f"[ox-gateway] istek kendi icinde duzeltildi -> model='{m}', "
-                                      f"varyant={variants.index(vbase) + 1}/{len(variants)}")
-                            return resp.json()
-                        last_err = f"{m} -> HTTP {resp.status_code}: {resp.text[:300]}"
-                        _handle_upstream_failure(key, resp, ms, pool)
-                        if resp.status_code == 429:
-                            # Bu modelin gunluk limiti dolu -> sonraki modele gec
-                            print(f"[ox-gateway] '{m}' gunluk limite takildi, yedek modele geciliyor")
+                # Kirpilan turda ayni modeli, katlanmis token butcesiyle tekrar dene
+                cur_base = vbase
+                for _attempt in range(budget_tries + 1):
+                    payload_m = {**cur_base, "model": m}
+                    tried: set[str] = set()
+                    bad_payload = False
+                    truncated = False
+                    for _ in range(max_retries):
+                        key = await pool.acquire(skip=tried)
+                        if key is None:
                             break
-                        if 400 <= resp.status_code < 500:
-                            # Istek icerigi bu model icin gecersiz -> sadelestirip dene
-                            print(f"[ox-gateway] '{m}' istegi reddetti ({resp.status_code}), "
-                                  f"parametreler sadelestiriliyor")
-                            bad_payload = True
-                            break
-                        # 5xx -> ayni modelde diger key
-                    except httpx.HTTPError as e:
-                        ms = (time.perf_counter() - t0) * 1000
-                        last_err = f"{m} -> Network error: {e}"
-                        pool.mark_failed(key)
-                        pool.record(key, ms, ok=False)
-                if bad_payload:
-                    break  # sonraki payload varyanti
+                        tried.add(key)
+                        await THROTTLE.wait()
+                        headers = {"Authorization": f"Bearer {key}",
+                                   "Content-Type": "application/json"}
+                        t0 = time.perf_counter()
+                        try:
+                            async with httpx.AsyncClient(timeout=_timeouts()) as client:
+                                resp = await client.post(OPENROUTER_URL, json=payload_m,
+                                                         headers=headers)
+                            ms = (time.perf_counter() - t0) * 1000
+                            if resp.status_code == 200:
+                                pool.mark_ok(key)
+                                pool.record(key, ms, ok=True)
+                                data = resp.json()
+                                if _openai_turn_is_empty(data):
+                                    truncated = True
+                                    break
+                                if m != primary or cur_base is not variants[0]:
+                                    print(f"[ox-gateway] istek kendi icinde duzeltildi -> "
+                                          f"model='{m}', varyant={variants.index(vbase) + 1}"
+                                          f"/{len(variants)}")
+                                return data
+                            last_err = f"{m} -> HTTP {resp.status_code}: {resp.text[:300]}"
+                            _handle_upstream_failure(key, resp, ms, pool)
+                            if resp.status_code == 429:
+                                # Bu modelin gunluk limiti dolu -> sonraki modele gec
+                                print(f"[ox-gateway] '{m}' gunluk limite takildi, "
+                                      f"yedek modele geciliyor")
+                                break
+                            if 400 <= resp.status_code < 500:
+                                # Istek icerigi bu model icin gecersiz -> sadelestirip dene
+                                print(f"[ox-gateway] '{m}' istegi reddetti ({resp.status_code}), "
+                                      f"parametreler sadelestiriliyor")
+                                bad_payload = True
+                                break
+                            # 5xx -> ayni modelde diger key
+                        except httpx.HTTPError as e:
+                            ms = (time.perf_counter() - t0) * 1000
+                            last_err = f"{m} -> Network error: {e}"
+                            pool.mark_failed(key)
+                            pool.record(key, ms, ok=False)
+                    if bad_payload:
+                        break  # sonraki payload varyanti
+                    if truncated:
+                        # token butcesi reasoning'e gitti, tool_call uretilmedi
+                        # -> ayni modeli daha genis butceyle tekrar dene
+                        if _attempt < budget_tries:
+                            old = int(payload_m.get("max_tokens") or 0)
+                            cur_base = {**cur_base, "max_tokens": _next_token_budget(old)}
+                            print(f"[ox-gateway] '{m}' cevabi kirpildi (max_tokens={old}, "
+                                  f"tool_call yok) -> {cur_base['max_tokens']} ile tekrar "
+                                  f"deneniyor (deneme {_attempt + 2}/{budget_tries + 1})")
+                            continue
+                        print(f"[ox-gateway] '{m}' kirpilan cevap verildi; graceful metne dusuluyor")
+                        return _graceful_result(m)
+                    break  # bu modelde normal cevap alindi ya da basarisiz
         if rnd < rounds - 1:
             print(f"[ox-gateway] zincir tukendi, {MAX_COOLDOWN_S:.0f}s sonra tekrar denenecek "
                   f"(tur {rnd + 2}/{rounds})")
@@ -804,6 +911,7 @@ async def open_stream(payload: dict, model: str | None = None, pool=None):
     primary = model or get_active_model()
     pool = pool or POOLS["2"]
     base_payload = {k: v for k, v in payload.items() if k != "model"}
+    base_payload = _apply_budget_floor(base_payload)
     max_retries = CONFIG.get("max_retries", 3)
     first_token_s = max(1.0, float(CONFIG.get("first_token_ms", 20000)) / 1000.0)
     rounds = max(1, int(CONFIG.get("heal_retries", 2)))
