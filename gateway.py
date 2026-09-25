@@ -17,8 +17,10 @@ import json
 import os
 import secrets
 import shutil
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 from cryptography.fernet import Fernet
@@ -80,26 +82,52 @@ def save_vault(keys: list[str]):
     save_vault_mode(str(CONFIG.get("active_mode", "1")), keys)
 
 
+_VAULT_LOCK = threading.RLock()
+
+
+class VaultError(RuntimeError):
+    """Kasa okunamadi/ cozulemedi. ANAHTAR KAYBI riski olan durum."""
+
+
+def _vault_backup_path() -> Path:
+    return VAULT_PATH.with_suffix(".json.corrupt")
+
+
 def load_vault_dict() -> dict:
     """Sifreli kasadan mod bazli key'leri okur: {"1": [...], "2": [...]}.
 
     Eski format (duz liste) gorulurse: tum keyler 2. moda (OpenRouter)
-    tasinir, 1. mod (Atria) bos kalir. Eski keyler ASLA silinmez."""
+    tasinir, 1. mod (Atria) bos kalir. Eski keyler ASLA silinmez.
+
+    ONEMLI: decrypt/cozme hatasi ARTIK sessizce bos liste dondurmuyor.
+    Onceki surum `return {"1": [], "2": []}` yapip bir sonraki yazmada gercek
+    kasayi UZERINE YAZIYORDU -> secret.key bozulunca tum key'ler kalici gidiyordu.
+    Artik hata yukari firlatilir ve kasa .corrupt yedeklenir."""
     if VAULT_PATH.exists():
+        blob = None
         try:
             blob = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            # okunamadi: yedekle ve yukari firlat
+            _quarantine_vault(f"okunamadi: {e}")
+            raise VaultError(f"vault.json okunamadi ({e}); yedek: {_vault_backup_path()}")
+        try:
             raw = json.loads(_FERNET.decrypt(blob["data"].encode()).decode())
-            if isinstance(raw, dict):
-                return {
-                    "1": list(raw.get("1") or []),
-                    "2": list(raw.get("2") or []),
-                }
-            if isinstance(raw, list):
-                migrated = {"1": [], "2": list(raw)}
-                save_vault_dict(migrated)
-                return migrated
-        except Exception:
-            return {"1": [], "2": []}
+        except Exception as e:
+            _quarantine_vault(f"cozulemedi: {e}")
+            raise VaultError(
+                "vault.json COZULEMEDI. secret.key degismis olabilir. "
+                f"Kasa kaybolmadi, yedeklendi: {_vault_backup_path()}. "
+                "Eski secret.key'i geri koyup tekrar dene.")
+        if isinstance(raw, dict):
+            return {
+                "1": list(raw.get("1") or []),
+                "2": list(raw.get("2") or []),
+            }
+        if isinstance(raw, list):
+            migrated = {"1": [], "2": list(raw)}
+            save_vault_dict(migrated)
+            return migrated
     # migrate: config.json icindeki duz keyleri 2. moda tasi
     keys = list(CONFIG.get("api_keys") or [])
     out = {"1": [], "2": keys}
@@ -111,18 +139,38 @@ def load_vault_dict() -> dict:
     return out
 
 
-def save_vault_dict(vault: dict):
-    """Mod bazli key'leri Fernet ile sifreleyip vault.json'a yazar."""
+def _quarantine_vault(reason: str) -> None:
+    """Bozuk kasayi .corrupt olarak yedekle; ASLA silme/uzerine yazma."""
+    try:
+        if VAULT_PATH.exists():
+            bak = _vault_backup_path()
+            bak.write_bytes(VAULT_PATH.read_bytes())
+            print(f"[ox-gateway] !! KASA SORUNU ({reason}) -> yedeklendi: {bak}")
+    except Exception as e:
+        print(f"[ox-gateway] !! kasa yedeklenemedi: {e}")
+
+
+def save_vault_dict(vault: dict) -> None:
+    """Mod bazli key'leri Fernet ile sifreleyip vault.json'a yazar (atomik)."""
     clean = {"1": list(vault.get("1") or []), "2": list(vault.get("2") or [])}
     data = _FERNET.encrypt(json.dumps(clean).encode()).decode()
-    VAULT_PATH.write_text(json.dumps({"data": data}, indent=2), encoding="utf-8")
+    payload = json.dumps({"data": data}, indent=2)
+    # yarisma (race) ve yarim yazimayi onlemek icin: ayni dosyaya yazip atomik degistir
+    with _VAULT_LOCK:
+        tmp = VAULT_PATH.with_suffix(".json.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(str(tmp), str(VAULT_PATH))
 
 
 def save_vault_mode(mode: str, keys: list[str]):
-    """Tek modun keylerini gunceller, diger modun keylerine dokunmaz."""
-    d = load_vault_dict()
-    d[str(mode)] = list(keys)
-    save_vault_dict(d)
+    """Tek modun keylerini gunceller, diger modun keylerine dokunmaz.
+
+    Lock'lu: eski surumde load->modify->save yarismasi vardi; Mod 1 ve Mod 2'ye
+    es zamanli /keys/add cagrisinda biri digerini eziyordu."""
+    with _VAULT_LOCK:
+        d = load_vault_dict()
+        d[str(mode)] = list(keys)
+        save_vault_dict(d)
 
 
 CONFIG = load_config()
@@ -336,7 +384,14 @@ class KeyPool:
         return out
 
 
-_VAULT = load_vault_dict()
+try:
+    _VAULT = load_vault_dict()
+    VAULT_ERROR: str | None = None
+except VaultError as e:
+    # Sunucu yine ayaga kalsin ama kasa UZERINE YAZILMASIN.
+    _VAULT = {"1": [], "2": []}
+    VAULT_ERROR = str(e)
+    print("[ox-gateway] !! BASLATILDI AMA KEY HAVUZU BOS: " + str(e))
 
 POOLS: dict[str, KeyPool] = {}
 for _m in ("1", "2"):
@@ -412,27 +467,85 @@ def _rate_limit_reset_seconds(resp: httpx.Response) -> float | None:
     return max(0.0, v / 1000.0)  # kalan sure (ms)
 
 
+def _openai_content_to_text(content) -> str:
+    """OpenAI content alanini duz metne cevirir (str veya multimodal dizi)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                t = p.get("text")
+                if t:
+                    parts.append(str(t))
+            elif p:
+                parts.append(str(p))
+        return " ".join(parts)
+    return str(content)
+
+
 def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
-    """OpenAI chat payload'ini Atria (/v1/messages, Anthropic format) icin cevirir."""
+    """OpenAI chat payload'ini Atria (/v1/messages, Anthropic format) icin cevirir.
+
+    Cok turluk tool dongusu desteklenir:
+      - assistant tool_calls  -> content icindeki tool_use bloklari
+      - role:"tool" mesaji    -> user icindeki tool_result blogu (tool_use_id ile)
+    Bunlar once tamamen atiliyordu; model gecmisi kaybediyordu."""
     msgs = payload_openai.get("messages") or []
     system_parts: list[str] = []
     conv: list[dict] = []
+
     for m in msgs:
         role = (m.get("role") or "user").strip().lower()
-        content = m.get("content") or ""
-        if isinstance(content, list):
-            content = " ".join(
-                str(p.get("text", "")) if isinstance(p, dict) else str(p)
-                for p in content
-            )
-        content = str(content)
-        if role == "system":
-            if content:
-                system_parts.append(content)
+        text = _openai_content_to_text(m.get("content"))
+
+        if role in ("system", "developer"):
+            if text:
+                system_parts.append(text)
             continue
-        if role not in ("user", "assistant"):
-            role = "user"
-        conv.append({"role": role, "content": content})
+
+        # ---- tool sonucu mesaji -> tool_result blogu ----
+        if role == "tool":
+            tid = m.get("tool_call_id") or ""
+            conv.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}],
+            })
+            continue
+
+        if role == "assistant":
+            blocks: list[dict] = []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except (ValueError, TypeError):
+                        args = {"_raw": args}
+                elif not isinstance(args, dict):
+                    args = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id") or f"toolu_{len(conv)}",
+                    "name": fn.get("name", ""),
+                    "input": args,
+                })
+            if blocks:
+                conv.append({"role": "assistant", "content": blocks})
+            elif text:
+                conv.append({"role": "assistant", "content": text})
+            continue
+
+        # ---- user (ve digerleri) ----
+        conv.append({"role": "user", "content": text})
+
     if not conv:
         conv = [{"role": "user", "content": ""}]
     out: dict = {
@@ -444,6 +557,11 @@ def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
         out["system"] = "\n".join(system_parts)
     if payload_openai.get("temperature") is not None:
         out["temperature"] = payload_openai["temperature"]
+    if payload_openai.get("top_p") is not None:
+        out["top_p"] = payload_openai["top_p"]
+    if payload_openai.get("stop") is not None:
+        out["stop_sequences"] = ([payload_openai["stop"]] if isinstance(
+            payload_openai["stop"], str) else list(payload_openai["stop"]))
     tools = payload_openai.get("tools")
     if isinstance(tools, list):
         a_tools = []
@@ -461,6 +579,21 @@ def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
             })
         if a_tools:
             out["tools"] = a_tools
+    tc = payload_openai.get("tool_choice")
+    if isinstance(tc, str):
+        if tc in ("required", "any"):
+            out["tool_choice"] = {"type": "any"}
+        elif tc in ("auto", "none"):
+            out["tool_choice"] = {"type": tc}
+        elif tc == "required":
+            out["tool_choice"] = {"type": "any"}
+    elif isinstance(tc, dict):
+        fn = tc.get("function") or {}
+        nm = fn.get("name") or tc.get("name")
+        if nm:
+            out["tool_choice"] = {"type": "tool", "name": nm}
+        elif tc.get("type"):
+            out["tool_choice"] = {"type": tc["type"]}
     return out
 
 
@@ -1063,7 +1196,13 @@ app = FastAPI(title="ox-gateway", version="1.2")
 
 class Message(BaseModel):
     role: str
-    content: str
+    # str veya multimodal dizi (OpenAI content parts) olabilir
+    content: Any = ""
+    # role:"tool" sonucu icin:
+    tool_call_id: str | None = None
+    name: str | None = None
+    # multimodal parcalar icin gerekebilir
+    tool_calls: list[dict] | None = None
 
 
 class ChatRequest(BaseModel):
@@ -1072,6 +1211,24 @@ class ChatRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     stream: bool = False
+    # --- asagidakiler once tamamen yoktu; tool kullanan istemciler 422 aliyordu ---
+    tools: list[dict] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
+    stop: Any = None
+    top_p: float | None = None
+    seed: int | None = None
+    response_format: dict | None = None
+    reasoning_effort: str | None = None
+
+
+def _openai_messages_to_payload(msgs: list[Message]) -> list[dict]:
+    """Message modellerini OpenAI formatina cevirir; content dizi olarak kalir."""
+    out: list[dict] = []
+    for m in msgs:
+        d = m.model_dump(exclude_none=True)
+        out.append(d)
+    return out
 
 
 class AgentRequest(BaseModel):
@@ -1135,11 +1292,21 @@ async def api_stats(mode: str | None = None):
 # Dashboard ve yonetim endpoint'leri localhost'ta aciktir.
 # --------------------------------------------------------------------------
 def check_auth(request: Request):
+    """Gateway anahtari kontrolu.
+
+    ONCEKI SURUM `?api_key=` query parametresini de kabul ediyordu; anahtar
+    boylece access loglarina, tarayici gecmisine ve proxy loglarina duserdi.
+    Artik SADECE header kabul edilir. Bir anahtar URL'de gorulurse istek
+    reddedilir ve uyari verilir."""
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not token:
-        token = request.headers.get("x-api-key", "") or request.query_params.get("api_key", "")
-    if token != GATEWAY_KEY:
+        token = request.headers.get("x-api-key", "")
+    if not token and request.query_params.get("api_key"):
+        print("[ox-gateway] UYARI: anahtar query string ile gonderilmeye calisildi "
+              "(reddedildi) — URL'ler loglanir, header kullan")
+        raise HTTPException(401, "Anahtar query string ile gonderilemez; header kullanin")
+    if not token or token != GATEWAY_KEY:
         raise HTTPException(401, "Gecersiz gateway API key")
 
 
@@ -1414,6 +1581,20 @@ def _reasoning_config(body: dict) -> dict | None:
 _ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                    "stop_sequence": "stop_sequence", "content_filter": "end_turn"}
 
+# Anthropic stop_reason -> OpenAI finish_reason
+_ANTHROPIC_TO_OPENAI_FINISH = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+    "pause_turn": "stop",
+    "refusal": "content_filter",
+}
+
+
+def _openai_finish(stop_reason: str | None) -> str:
+    return _ANTHROPIC_TO_OPENAI_FINISH.get(stop_reason or "", "stop")
+
 
 def _anthropic_stop(finish: str | None) -> str:
     return _ANTHROPIC_STOP.get(finish or "stop", "end_turn")
@@ -1529,6 +1710,7 @@ async def anthropic_messages(request: Request):
             # thinking ve text icin AYRI bloklar; her tool_call da kendi blogunda
             block_type: str | None = None   # None | "thinking" | "text" | "tool_use"
             block_index = -1
+            tool_block_index: int | None = None  # arguman delta'lari buraya yazilir
             cur_tool = None                 # su an akilan upstream tool kimligi (id/index)
             stop_reason = "end_turn"
             usage_out = 0
@@ -1548,7 +1730,7 @@ async def anthropic_messages(request: Request):
             })
 
             async def emit_block(kind: str, delta_txt: str, tool_name: str = "", tool_id: str = "", force: bool = False):
-                nonlocal block_type, block_index
+                nonlocal block_type, block_index, tool_block_index
                 if block_type != kind or force:
                     if block_type is not None:
                         yield _sse_event("content_block_stop", {
@@ -1561,6 +1743,7 @@ async def anthropic_messages(request: Request):
                             "content_block": {"type": "thinking", "thinking": ""},
                         })
                     elif kind == "tool_use":
+                        tool_block_index = block_index
                         yield _sse_event("content_block_start", {
                             "type": "content_block_start", "index": block_index,
                             "content_block": {
@@ -1623,9 +1806,15 @@ async def anthropic_messages(request: Request):
                                     ):
                                         yield chunk
                                     cur_tool = tkey
-                                if fn.get("arguments") and block_type == "tool_use":
+                                # Argumanlar SADECE aktif tool blogunun indeksine
+                                # yazilir. Onceki kod `block_type == "tool_use"`
+                                # sartini koyuyordu; araya metin girince
+                                # (block_type == "text") tool argumanlari
+                                # sessizce kayboluyordu.
+                                if fn.get("arguments") and tool_block_index is not None:
                                     yield _sse_event("content_block_delta", {
-                                        "type": "content_block_delta", "index": block_index,
+                                        "type": "content_block_delta",
+                                        "index": tool_block_index,
                                         "delta": {"type": "input_json_delta",
                                                   "partial_json": fn["arguments"]},
                                     })
@@ -1737,6 +1926,8 @@ class KeyAddRequest(BaseModel):
 
 @app.post("/keys/add")
 async def keys_add(req: KeyAddRequest):
+    if VAULT_ERROR:
+        raise HTTPException(503, f"Kasa okunamadi, yazma yapilmadi: {VAULT_ERROR}")
     m = str(req.mode or get_active_mode())
     if m not in ("1", "2"):
         raise HTTPException(400, "mod 1 veya 2 olmali")
@@ -1751,6 +1942,8 @@ class KeyRemoveRequest(BaseModel):
 
 @app.post("/keys/remove")
 async def keys_remove(req: KeyRemoveRequest):
+    if VAULT_ERROR:
+        raise HTTPException(503, f"Kasa okunamadi, yazma yapilmadi: {VAULT_ERROR}")
     m = str(req.mode or get_active_mode())
     if m not in ("1", "2"):
         raise HTTPException(400, "mod 1 veya 2 olmali")
@@ -1857,11 +2050,25 @@ async def set_model(req: ModelSetRequest):
 async def chat_completions(request: Request, req: ChatRequest):
     """OpenAI-uyumlu proxy noktasi; gateway api key ister. stream:true -> SSE."""
     check_auth(request)
-    payload: dict = {"messages": [m.model_dump() for m in req.messages]}
+    payload: dict = {"messages": _openai_messages_to_payload(req.messages)}
     if req.temperature is not None:
         payload["temperature"] = req.temperature
     if req.max_tokens is not None:
         payload["max_tokens"] = req.max_tokens
+    if req.tools:
+        payload["tools"] = req.tools
+    if req.tool_choice is not None:
+        payload["tool_choice"] = req.tool_choice
+    if req.parallel_tool_calls is not None:
+        payload["parallel_tool_calls"] = req.parallel_tool_calls
+    if req.stop is not None:
+        payload["stop"] = req.stop
+    if req.top_p is not None:
+        payload["top_p"] = req.top_p
+    if req.seed is not None:
+        payload["seed"] = req.seed
+    if req.response_format is not None:
+        payload["response_format"] = req.response_format
 
     # ---- Streaming (SSE) ----
     if req.stream:
@@ -1879,50 +2086,78 @@ async def chat_completions(request: Request, req: ChatRequest):
                         yield chunk
                     yield b"data: [DONE]\n\n"
                     return
-                ev = ""
-                finished = False
+                seen_tools: dict = {}
+                thinking_open = False
+                final_reason = None
+
+                def _ochunk(delta: dict, finish=None):
+                    return {
+                        "id": "chatcmpl-atria", "object": "chat.completion.chunk",
+                        "created": int(time.time()), "model": model_a,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    }
+
                 try:
                     line = first_line
                     while True:
                         s = (line or "").strip()
-                        if s.startswith("event:"):
-                            ev = s[6:].strip()
-                        elif s.startswith("data:"):
+                        if s.startswith("data:"):
                             try:
                                 j = json.loads(s[5:].strip())
                             except ValueError:
                                 j = None
-                            if j is not None:
+                            if isinstance(j, dict):
                                 t = j.get("type")
-                                txt = ""
-                                if t == "content_block_delta":
+                                if t == "content_block_start":
+                                    cb = j.get("content_block") or {}
+                                    if cb.get("type") == "tool_use":
+                                        idx = len(seen_tools)
+                                        seen_tools[cb.get("index", idx)] = cb.get("name", "")
+                                        yield ("data: " + json.dumps(_ochunk({
+                                            "tool_calls": [{
+                                                "index": idx,
+                                                "id": cb.get("id") or f"call_{idx}",
+                                                "type": "function",
+                                                "function": {"name": cb.get("name", ""),
+                                                             "arguments": ""},
+                                            }]
+                                        })) + "\n\n").encode()
+                                    elif cb.get("type") == "thinking":
+                                        thinking_open = True
+                                elif t == "content_block_delta":
                                     d = j.get("delta") or {}
-                                    txt = d.get("text") or ""
-                                if txt:
-                                    chunk = {
-                                        "id": "chatcmpl-atria", "object": "chat.completion.chunk",
-                                        "created": int(time.time()), "model": model_a,
-                                        "choices": [{"index": 0, "delta": {"content": txt},
-                                                     "finish_reason": None}],
-                                    }
-                                    yield ("data: " + json.dumps(chunk) + "\n\n").encode()
-                                if t in ("message_stop", "message_delta") and not finished:
-                                    # bitis chunk'i bir kez gonderilir (asagida DONE ile)
-                                    pass
+                                    if d.get("type") == "thinking_delta" and d.get("thinking"):
+                                        yield ("data: " + json.dumps(_ochunk({
+                                            "reasoning": d["thinking"]})) + "\n\n").encode()
+                                    elif d.get("type") == "input_json_delta":
+                                        yield ("data: " + json.dumps(_ochunk({
+                                            "tool_calls": [{
+                                                "index": 0,
+                                                "function": {"arguments":
+                                                             d.get("partial_json", "")},
+                                            }]
+                                        })) + "\n\n").encode()
+                                    elif d.get("text"):
+                                        yield ("data: " + json.dumps(_ochunk({
+                                            "content": d["text"]})) + "\n\n").encode()
+                                elif t == "message_delta":
+                                    sr = (j.get("delta") or {}).get("stop_reason")
+                                    if sr:
+                                        final_reason = _openai_finish(sr)
+                                elif t == "message_stop":
+                                    final_reason = final_reason or "stop"
                         try:
-                            line = await asyncio.wait_for(line_iter.__anext__(), timeout=stall_a)
+                            line = await asyncio.wait_for(line_iter.__anext__(),
+                                                           timeout=stall_a)
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
-                            err = {"error": {"message": f"stream {stall_a:.0f}s ver gelmeyince kapatildi"}}
+                            err = {"error": {"message":
+                                             f"stream {stall_a:.0f}s ver gelmeyince kapatildi"}}
                             yield ("data: " + json.dumps(err) + "\n\n").encode()
                             break
-                    fin = {
-                        "id": "chatcmpl-atria", "object": "chat.completion.chunk",
-                        "created": int(time.time()), "model": model_a,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield ("data: " + json.dumps(fin) + "\n\n").encode()
+                    yield ("data: " + json.dumps(_ochunk({}, final_reason or "stop"))
+                           + "\n\n").encode()
                     yield b"data: [DONE]\n\n"
                 except Exception as e:
                     print(f"[ox-gateway] atria->openai stream hatasi: {e}")
