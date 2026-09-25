@@ -63,6 +63,16 @@ msg = client.messages.create(model="Atria-Dawn-Preview", max_tokens=1024,
 
 Dashboard'daki **🟢 OpenAI / 🧠 Anthropic** düğmeleriyle aktif protokolü tek tuşla değiştir.
 
+## 🧩 OpenCode'a otomatik sync
+
+```bash
+py -3 sync_opencode.py            # modelleri ~/.config/opencode/opencode.json'a ekle/güncelle
+py -3 sync_opencode.py --dry-run  # ne yapılacağını göster
+```
+
+Aktif `provider_models` + free fallback'ları OpenCode'un `ox` provider'ına `tool_call:true` ile yazar,
+önce mevcut dosyayı `.json.bak-<tarih>` olarak yedekler, **eski modelleri silmez**.
+
 ## 🖥️ Dashboard
 
 | Bölüm | Ne yapar |
