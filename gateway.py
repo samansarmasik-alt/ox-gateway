@@ -529,30 +529,21 @@ def _atria_headers(key: str) -> dict:
 # max_tokens'i katlayarak ayni istegi tekrar gonderir.
 # --------------------------------------------------------------------------
 def _openai_turn_is_empty(result: dict) -> bool:
-    """OpenAI formatinda cevap metin ve tool_call icermiyorsa kirpilmistir."""
+    """OpenAI formatinda cevap kirpildiysa True (finish_reason == "length").
+
+    Agent istemcilerde max_tokens'a takilmis bir tur, icerik uretmis olsa bile
+    "yarim kaldi" sayilir: Claude Code / opencode o turda bekleyi kesip durur.
+    Bu yuzden bos mu dolu mu farki yok, tek sart finish_reason == 'length'."""
     try:
-        msg = result["choices"][0]["message"]
+        ch = result["choices"][0]
     except (KeyError, IndexError, TypeError):
         return False
-    has_text = bool((msg.get("content") or "").strip())
-    has_tool = bool(msg.get("tool_calls"))
-    has_reasoning = bool((msg.get("reasoning") or "").strip())
-    truncated = result["choices"][0].get("finish_reason") == "length"
-    return truncated and not has_text and not has_tool and has_reasoning
+    return ch.get("finish_reason") == "length"
 
 
 def _anthropic_turn_is_empty(anth: dict) -> bool:
-    """Anthropic formatinda cevap sadece thinking iceriyor ve kirpilmis ise True."""
-    if anth.get("stop_reason") != "max_tokens":
-        return False
-    for b in anth.get("content") or []:
-        if not isinstance(b, dict):
-            continue
-        if b.get("type") == "text" and (b.get("text") or "").strip():
-            return False
-        if b.get("type") == "tool_use":
-            return False
-    return True
+    """Anthropic formatinda cevap kirpildiysa True (stop_reason == "max_tokens")."""
+    return anth.get("stop_reason") == "max_tokens"
 
 
 def _next_token_budget(current: int | None) -> int:
@@ -569,6 +560,42 @@ def _token_budget_tries() -> int:
     return max(1, int(CONFIG.get("token_budget_tries", 3)))
 
 
+def _reasoning_budget(payload: dict) -> int:
+    cur = payload.get("reasoning")
+    if isinstance(cur, dict):
+        try:
+            return int(cur.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _openai_turn_is_degenerate(result: dict, had_tools: bool) -> bool:
+    """Arac sunulmusken uretilen neredeyse bos tur (bozuk cevap).
+
+    Olculen ornek: tool_uses=0, output_tokens=18, text 49 karakter,
+    reasoning 0 -> istemci (Claude Code) "is bitti" sanip duruyor.
+    Boyle turler yeniden denenir; sadece sunucu hatasinda degil."""
+    if not had_tools:
+        return False
+    try:
+        ch = result["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return False
+    if ch.get("finish_reason") not in (None, "stop"):
+        return False
+    if ch.get("tool_calls"):
+        return False
+    try:
+        out = int((result.get("usage") or {}).get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        out = 0
+    text = ((ch.get("message") or {}).get("content") or "")
+    if out > int(CONFIG.get("degenerate_token_floor", 64)):
+        return False
+    return len(text.strip()) < int(CONFIG.get("degenerate_char_ceiling", 400))
+
+
 def _apply_budget_floor(payload: dict) -> dict:
     """Streaming icin token butce tabani: reasoning + tool_call bir arada sigsin.
 
@@ -579,6 +606,25 @@ def _apply_budget_floor(payload: dict) -> dict:
     if 0 < cur < floor:
         payload = {**payload, "max_tokens": floor}
     return payload
+
+
+# --------------------------------------------------------------------------
+# Tur teshisi: istemciye (Claude Code / opencode) ne dondurdugumuzu kanitlar.
+# "Agent neden duruyor" sorusunun cevabi buradan okunur: GET /api/diag
+# --------------------------------------------------------------------------
+DIAG: dict = {"last": None, "turns": 0, "empty_turns": 0, "truncated_turns": 0}
+
+
+def _diag(turn: dict):
+    """Bir turu kaydet; tur bitisinde /api/diag uzerinden okunur."""
+    DIAG["turns"] = DIAG["turns"] + 1
+    DIAG["last"] = turn
+    if not turn.get("has_text") and not turn.get("has_tool_use"):
+        DIAG["empty_turns"] = DIAG["empty_turns"] + 1
+    if turn.get("stop_reason") in ("max_tokens", "length"):
+        DIAG["truncated_turns"] = DIAG["truncated_turns"] + 1
+    print("[ox-gateway] turn: " + json.dumps(turn, ensure_ascii=False))
+
 
 
 async def _await_truncation_retry(delay: float = 0.4):
@@ -826,11 +872,13 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
             for m in await _candidate_models(primary):
                 # Kirpilan turda ayni modeli, katlanmis token butcesiyle tekrar dene
                 cur_base = vbase
+                degenerate = False
                 for _attempt in range(budget_tries + 1):
                     payload_m = {**cur_base, "model": m}
                     tried: set[str] = set()
                     bad_payload = False
                     truncated = False
+                    degenerate = False
                     for _ in range(max_retries):
                         key = await pool.acquire(skip=tried)
                         if key is None:
@@ -851,6 +899,15 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
                                 data = resp.json()
                                 if _openai_turn_is_empty(data):
                                     truncated = True
+                                    break
+                                # Bozuk/neredeyse-bos tur: arac sunulmus ama model
+                                # 2 kelimeyle turu kapatti -> yeniden dene
+                                if (not truncated
+                                        and _attempt < budget_tries
+                                        and _openai_turn_is_degenerate(
+                                            data, bool(payload_m.get("tools")))):
+                                    degenerate = True
+                                    DIAG["degenerate_turns"] = DIAG.get("degenerate_turns", 0) + 1
                                     break
                                 if m != primary or cur_base is not variants[0]:
                                     print(f"[ox-gateway] istek kendi icinde duzeltildi -> "
@@ -878,6 +935,18 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
                             pool.record(key, ms, ok=False)
                     if bad_payload:
                         break  # sonraki payload varyanti
+                    if degenerate:
+                        # arac sunulmus ama model neredeyse bos tur dondurdu
+                        # -> reasoning butcesini katlayip ayni modeli tekrar dene
+                        if _attempt < budget_tries:
+                            nb = _next_token_budget(_reasoning_budget(cur_base))
+                            cur_base = {**cur_base, "reasoning": {"max_tokens": nb}}
+                            DIAG["last_retry"] = {"model": m, "reasoning": nb}
+                            print(f"[ox-gateway] '{m}' bozuk tur (tool_call yok, "
+                                  f"neredeyse bos metin) -> reasoning {nb} ile tekrar deneniyor "
+                                  f"(deneme {_attempt + 2}/{budget_tries + 1})")
+                            continue
+                        break  # deneme hakki bitti, normal cevabi kabul et
                     if truncated:
                         # token butcesi reasoning'e gitti, tool_call uretilmedi
                         # -> ayni modeli daha genis butceyle tekrar dene
@@ -1112,6 +1181,29 @@ class ModeSetRequest(BaseModel):
     mode: str
 
 
+@app.get("/api/diag")
+async def diag():
+    """Son tur teşhisi: istemciye ne döndük? (Claude Code neden duruyor sorusunun kaniti)"""
+    return {
+        "active_mode": get_active_mode(),
+        "provider": get_provider()["name"],
+        "model": get_active_model(),
+        "turns": DIAG["turns"],
+        "empty_turns": DIAG["empty_turns"],
+        "truncated_turns": DIAG["truncated_turns"],
+        "last": DIAG["last"],
+    }
+
+
+@app.post("/api/diag/reset")
+async def diag_reset():
+    DIAG["turns"] = 0
+    DIAG["empty_turns"] = 0
+    DIAG["truncated_turns"] = 0
+    DIAG["last"] = None
+    return {"reset": True}
+
+
 @app.get("/api/providers")
 async def providers_info():
     """Iki provider/modun durumu: 1 = Atria, 2 = OpenRouter."""
@@ -1231,9 +1323,26 @@ def _anthropic_to_openai(body: dict) -> dict:
 
 def _reasoning_config(body: dict) -> dict | None:
     """Anthropic 'thinking' alanini OpenRouter reasoning'e cevirir.
-    Agentic araclar dusunme metniyle calisamadigi icin reasoning'i minimal butceye
-    indir (hizli, sade cevap, output ile karismaz)."""
-    return {"max_tokens": 64}
+
+    Dusunme butcesi 'reasoning_max_tokens' ile ayarlanir (varsayilan 1024).
+    Eskiden 64'e zorlaniyordu; olcum gosterdi ki model arac cagrisi uretmek
+    yerine anlatim metnine yaziliyordu (tool_uses=0, 16k karakter salt metin).
+    Butceyi kisitlamak planlama yapmasini engelliyordu. 0 verilirse
+    reasoning tamamen kapatilir.
+    Istemci kendi thinking budget'u gonderdiyse ona dokunulmaz."""
+    client_budget = 0
+    th = body.get("thinking")
+    if isinstance(th, dict):
+        try:
+            client_budget = int(th.get("budget_tokens") or 0)
+        except (TypeError, ValueError):
+            client_budget = 0
+    if client_budget > 0:
+        return None  # istemci kendi butcesini yonetiyor
+    budget = int(CONFIG.get("reasoning_max_tokens", 1024))
+    if budget <= 0:
+        return None
+    return {"max_tokens": budget}
 
 
 _ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
@@ -1357,6 +1466,10 @@ async def anthropic_messages(request: Request):
             cur_tool = None                 # su an akilan upstream tool kimligi (id/index)
             stop_reason = "end_turn"
             usage_out = 0
+            finish_reason = None
+            text_chars = 0
+            think_chars = 0
+            tool_count = 0
             msg_id = "msg_" + str(int(time.time() * 1000))
 
             yield _sse_event("message_start", {
@@ -1412,7 +1525,7 @@ async def anthropic_messages(request: Request):
             try:
                 line = first_line
                 while True:
-                    if line.startswith("data: ") and "[DONE]" not in line:
+                    if line and line.startswith("data: ") and "[DONE]" not in line:
                         try:
                             j = json.loads(line[6:])
                         except ValueError:
@@ -1434,6 +1547,7 @@ async def anthropic_messages(request: Request):
                                 fn = tc.get("function", {})
                                 tkey = str(tc.get("id") or tc.get("index", ti))
                                 if fn.get("name"):
+                                    tool_count += 1
                                     force_new = (tkey != cur_tool) or (block_type != "tool_use")
                                     async for chunk in emit_block(
                                         "tool_use", "",
@@ -1451,7 +1565,12 @@ async def anthropic_messages(request: Request):
                                     })
                             fr = ch.get("finish_reason")
                             if fr:
+                                finish_reason = fr
                                 stop_reason = _anthropic_stop(fr)
+                            if ct:
+                                text_chars += len(ct)
+                            if rt:
+                                think_chars += len(rt)
                             if j.get("usage"):
                                 usage_out = j["usage"].get("completion_tokens", usage_out)
                     elif line.startswith("data: [DONE]"):
@@ -1476,6 +1595,22 @@ async def anthropic_messages(request: Request):
                     "usage": {"output_tokens": usage_out},
                 })
                 yield _sse_event("message_stop", {"type": "message_stop"})
+                _diag({
+                    "path": "/v1/messages",
+                    "mode": get_active_mode(),
+                    "provider": get_provider()["name"],
+                    "model": model,
+                    "client_max_tokens": body.get("max_tokens"),
+                    "sent_max_tokens": payload.get("max_tokens"),
+                    "finish_reason": finish_reason,
+                    "stop_reason": stop_reason,
+                    "text_chars": text_chars,
+                    "think_chars": think_chars,
+                    "tool_uses": tool_count,
+                    "output_tokens": usage_out,
+                    "has_text": text_chars > 0,
+                    "has_tool_use": tool_count > 0,
+                })
             except Exception as e:
                 # Akis ortinda upstream koptu -> ASGI cokmesin, agent'e hata yerine
                 # kisa bir aciklama metni akitip protokol kurallarina uygun kapat
