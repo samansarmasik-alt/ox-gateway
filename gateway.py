@@ -782,11 +782,16 @@ def _reasoning_budget(payload: dict) -> int:
 
 
 def _openai_turn_is_degenerate(result: dict, had_tools: bool) -> bool:
-    """Arac sunulmusken uretilen neredeyse bos tur (bozuk cevap).
+    """Arac sunulmusken uretilen neredeyse bos tur.
 
-    Olculen ornek: tool_uses=0, output_tokens=18, text 49 karakter,
-    reasoning 0 -> istemci (Claude Code) "is bitti" sanip duruyor.
-    Boyle turler yeniden denenir; sadece sunucu hatasinda degil."""
+    UYARI: bu tespit varsayilan olarak KAPALI. Deneyim gosterdi ki model
+    kisa/normal metin turlari uretir (orn. 3448 karakter), gateway bunu
+    "bozuk" sayip 3 kez tekrar deniyor, reasoning butcesini 3072 -> 6144 ->
+    12288'e cikarip turu 4 kat uuzatiyor, kota yiyor ve tool cagrisi yine
+    uretilmiyor. Bu bir regresyondu; varsayilan kapali.
+    `degenerate_retry: true` ile geri acilabilir (ozellikle kucuk modelerde)."""
+    if not CONFIG.get("degenerate_retry", False):
+        return False
     if not had_tools:
         return False
     try:
@@ -1148,14 +1153,17 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
                         break  # sonraki payload varyanti
                     if degenerate:
                         # arac sunulmus ama model neredeyse bos tur dondurdu
-                        # -> reasoning butcesini katlayip ayni modeli tekrar dene
+                        # -> sadece acikca istenirse ve OLCULU bir tavanla
+                        # (varsayilan kapali; bkz. _openai_turn_is_degenerate)
                         if _attempt < budget_tries:
-                            nb = _next_token_budget(_reasoning_budget(cur_base))
+                            base_r = _reasoning_budget(cur_base)
+                            nb = _next_token_budget(base_r)
+                            cap = int(CONFIG.get("max_reasoning_budget", 2048))
+                            nb = min(nb, max(base_r, cap))
                             cur_base = {**cur_base, "reasoning": {"max_tokens": nb}}
                             DIAG["last_retry"] = {"model": m, "reasoning": nb}
-                            print(f"[ox-gateway] '{m}' bozuk tur (tool_call yok, "
-                                  f"neredeyse bos metin) -> reasoning {nb} ile tekrar deneniyor "
-                                  f"(deneme {_attempt + 2}/{budget_tries + 1})")
+                            print(f"[ox-gateway] '{m}' bozuk tur -> reasoning {nb} ile "
+                                  f"tekrar (deneme {_attempt + 2}/{budget_tries + 1})")
                             continue
                         break  # deneme hakki bitti, normal cevabi kabul et
                     if truncated:
