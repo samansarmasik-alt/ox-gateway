@@ -1750,7 +1750,17 @@ def _openai_finish(stop_reason: str | None) -> str:
 
 
 def _anthropic_stop(finish: str | None) -> str:
-    return _ANTHROPIC_STOP.get(finish or "stop", "end_turn")
+    # "error" bilincli olarak end_turn DEGIL: upstream hata bildirince sahte
+    # basarili tur uretmek, istemciye (Claude Code) hata yerine bos/bitmis
+    # cevap gosteriyordu. end_turn'a eslenirse agent hatayi fark edemiyor.
+    if finish in (None, "", "error"):
+        return "end_turn"
+    return _ANTHROPIC_STOP.get(finish, "end_turn")
+
+
+def _openai_finish_is_error(finish: str | None) -> bool:
+    """Upstream streaming'te finish_reason olarak 'error' verdiyse hata budur."""
+    return finish == "error"
 
 
 def _openai_to_anthropic_blocks(message: dict) -> list[dict]:
@@ -1928,13 +1938,28 @@ async def anthropic_messages(request: Request):
             # Response baslamadan once hata cikabilir; response basladiktan
             # SONRA HTTPException firlatmak ASGI'yi cokertir. Bunun yerine
             # hatayi Anthropic-uyumlu SSE error event'i olarak akiyoruz.
-            try:
-                client, resp, line_iter, first_line = await open_stream(payload, model)
-            except Exception:
-                # Hata asla agante iletilmez: gecerli minimal bir basarili akis uretilir
-                for chunk in _anthropic_graceful_events():
-                    yield chunk
-                return
+            # Streaming bos/error cevap verirse (freemodel bazen 0 icerikle
+            # finish_reason=error donuyor) BIR SONRAKI modele gec.
+            # message_start ertelendigi icik bu noktada guvenli: istemciye
+            # hicbir sey gonderilmemis oluyor.
+            cands = await _candidate_models(model)
+            try_idx = 0
+            while True:
+                try:
+                    cand_model = cands[try_idx] if try_idx < len(cands) else model
+                    client, resp, line_iter, first_line = await open_stream(
+                        {**payload, "model": cand_model}, cand_model)
+                    break
+                except Exception:
+                    try_idx += 1
+                    if try_idx < len(cands):
+                        print(f"[ox-gateway] stream acilamadi, sonraki modele gecildi "
+                              f"(deneme {try_idx + 1}/{len(cands)})")
+                        continue
+                    # Hata asla agante iletilmez: gecerli minimal bir basarili akis uretilir
+                    for chunk in _anthropic_graceful_events():
+                        yield chunk
+                    return
             # thinking ve text icin AYRI bloklar; her tool_call da kendi blogunda
             block_type: str | None = None   # None | "thinking" | "text" | "tool_use"
             block_index = -1
@@ -2127,9 +2152,19 @@ async def anthropic_messages(request: Request):
                     "has_tool_use": tool_count > 0,
                 })
             except Exception as e:
-                # Akis ortinda upstream koptu -> ASGI cokmesin, agent'e hata yerine
-                # kisa bir aciklama metni akitip protokol kurallarina uygun kapat
+                # Akis ORTASINDA koptu (icerik baslamisti) -> temiz graceful kapanis
                 print(f"[ox-gateway] stream ortasinda hata, graceful kapanis: {e}")
+                _diag({
+                    "path": "/v1/messages", "mode": get_active_mode(),
+                    "provider": get_provider()["name"], "model": cand_model,
+                    "finish_reason": finish_reason, "stop_reason": stop_reason,
+                    "client_max_tokens": body.get("max_tokens"),
+                    "sent_max_tokens": payload.get("max_tokens"),
+                    "text_chars": text_chars, "think_chars": think_chars,
+                    "tool_uses": tool_count, "output_tokens": usage_out,
+                    "has_text": text_chars > 0, "has_tool_use": tool_count > 0,
+                    "mid_stream_error": str(e)[:200],
+                })
                 try:
                     if block_type is None:
                         block_index += 1
