@@ -1520,17 +1520,46 @@ async def keys_status(mode: str | None = None):
 # Anthropic Messages API uyumlulugu (/v1/messages)
 # --------------------------------------------------------------------------
 def _block_text(b: dict) -> str:
-    """tool_result icerigini duz metne cevirir (liste veya string)."""
+    """tool_result icerigindeki METNI ceker (liste veya string).
+
+    DIKKAT: burada sadece text alinir; tool_result icindeki 'image' bloklari
+    BASKA bir fonksiyonla (_block_images) toplanir. MCP screenshot gibi
+    gorsel donduren tool'lar bu yoldan gecerdi ve gorsel sessizce dusepdi."""
     rc = b.get("content", "")
     if isinstance(rc, list):
         parts = []
         for x in rc:
             if isinstance(x, dict):
-                parts.append(x.get("text", "") or "")
-            else:
+                if x.get("type") == "text":
+                    parts.append(x.get("text", "") or "")
+            elif x:
                 parts.append(str(x))
         return "\n".join(p for p in parts if p)
     return str(rc or "")
+
+
+def _block_images(b: dict) -> list[dict]:
+    """tool_result icerigindeki GORSEL bloklarini OpenAI image_url'e cevirir.
+
+    Claude Code MCP ekran goruntulerini tool_result icinde image blogu olarak
+    gonderir. Onceki surumde bunlar _block_text ile atiliyordu; model
+    'screenshot bos donuyor' diyordu."""
+    rc = b.get("content", "")
+    if not isinstance(rc, list):
+        return []
+    out: list[dict] = []
+    for x in rc:
+        if not isinstance(x, dict) or x.get("type") != "image":
+            continue
+        src = x.get("source") or {}
+        st = src.get("type")
+        if st == "base64" and src.get("data"):
+            mt = src.get("media_type") or "image/png"
+            out.append({"type": "image_url",
+                        "image_url": {"url": f"data:{mt};base64,{src['data']}"}})
+        elif st == "url" and src.get("url"):
+            out.append({"type": "image_url", "image_url": {"url": src["url"]}})
+    return out
 
 
 def _anthropic_to_openai(body: dict) -> dict:
@@ -1597,14 +1626,20 @@ def _anthropic_to_openai(body: dict) -> dict:
                     "function": {"name": b.get("name", ""), "arguments": args},
                 })
             elif t == "tool_result":
-                tool_results.append((b.get("tool_use_id", ""), _block_text(b)))
+                tool_results.append((b.get("tool_use_id", ""), _block_text(b),
+                                     _block_images(b)))
 
         # tool_result'lar ONCE gonderilir: OpenAI sirasi tool sonucu -> asistan
         if tool_results:
-            for tid, txt in tool_results:
-                if images:
-                    parts = [{"type": "text", "text": txt}] + images
-                    msgs.append({"role": "tool", "tool_call_id": tid, "content": parts})
+            for tid, txt, imgs in tool_results:
+                if imgs:
+                    # MCP screenshot gibi gorsel donduren tool sonuclari:
+                    # metin + image_url parcalarini birlikte ilet
+                    parts_t: list[dict] = []
+                    if txt:
+                        parts_t.append({"type": "text", "text": txt})
+                    parts_t.extend(imgs)
+                    msgs.append({"role": "tool", "tool_call_id": tid, "content": parts_t})
                 else:
                     msgs.append({"role": "tool", "tool_call_id": tid, "content": txt})
         if images and not texts and not tool_calls:
