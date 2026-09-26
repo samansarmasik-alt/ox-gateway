@@ -1773,12 +1773,87 @@ def _sse_event(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
 
+def _estimate_tokens(text: str) -> int:
+    """Kaba token tahmini: ~4 karakter/token (ASCII) / ~2.5 (unicode agirlikli)."""
+    if not text:
+        return 0
+    ascii_chars = sum(1 for c in text if ord(c) < 128)
+    return max(1, int(ascii_chars / 4 + (len(text) - ascii_chars) / 2.5))
+
+
+def _count_request_tokens(body: dict) -> int:
+    """Anthropic count_tokens icin girdi boyutunu tahmin eder.
+
+    Upstream'e istek atmaz (hem yavas hem kotada maliyetli). Amac sadece
+    SDK'nin "kac token kullandim" gostergesini doldurmak; +/-%5 sapma sorun degil."""
+    total = 0
+    sysv = body.get("system")
+    if isinstance(sysv, list):
+        for b in sysv:
+            total += _estimate_tokens(str((b or {}).get("text", "")))
+    elif sysv:
+        total += _estimate_tokens(str(sysv))
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            total += _estimate_tokens(c)
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text":
+                    total += _estimate_tokens(str(b.get("text", "")))
+                elif t == "thinking":
+                    total += _estimate_tokens(str(b.get("thinking", "")))
+                elif t == "tool_use":
+                    total += _estimate_tokens(str(b.get("name", "")))
+                    total += _estimate_tokens(json.dumps(b.get("input", {}), ensure_ascii=False))
+                elif t == "tool_result":
+                    total += _estimate_tokens(_block_text(b))
+                elif t == "image":
+                    # gorsel ~1.5k token (Claude Code gorsel ekledigi icin onemli)
+                    total += 1600
+        for tc in m.get("tool_calls") or []:
+            fn = (tc or {}).get("function") or {}
+            total += _estimate_tokens(str(fn.get("name", "")))
+            total += _estimate_tokens(str(fn.get("arguments", "")))
+    for t in body.get("tools") or []:
+        if isinstance(t, dict):
+            total += _estimate_tokens(str(t.get("name", "")))
+            total += _estimate_tokens(str(t.get("description", "")))
+            total += _estimate_tokens(json.dumps(t.get("input_schema", {}), ensure_ascii=False))
+    # konusma basina rol/ayrac eklenir
+    total += 4 * (len(body.get("messages") or []) + 1)
+    return total
+
+
 # Claude Code / Anthropic SDK: base_url olarak sadece http://127.0.0.1:8756
 # verilir. SDK kendisi /v1/messages ekler; biz de geriye donukluk icin /messages
 # yolunu destekliyoruz (ikisi de calisir).
 @app.post("/messages")
 async def anthropic_messages_root(request: Request):
     return await anthropic_messages(request)
+
+
+@app.post("/messages/count_tokens")
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    """Anthropic token sayim endpoint'i.
+
+    ONCEKI SURUMDE YOKTI -> 404. @ai-sdk/anthropic (opencode) ve Claude Code
+    bu endpoint'i cagirir; 404 alinca SDK tum istegi hata sayiyordu ve
+    istemci HIC CEVAP ALAMIYORDU. Dashboard cagirmadigi icin calisiyordu."""
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Gecersiz JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Gecersiz JSON")
+    return {"input_tokens": _count_request_tokens(body)}
 
 
 @app.post("/v1/messages")
