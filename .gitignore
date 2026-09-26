@@ -13,6 +13,7 @@ venv/
 # Test ciktilari
 *_out.txt
 *_err.txt
+logs/
 
 # IDE / OS
 .vscode/
