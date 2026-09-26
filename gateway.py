@@ -1873,17 +1873,31 @@ async def anthropic_messages(request: Request):
             tool_count = 0
             msg_id = "msg_" + str(int(time.time() * 1000))
 
-            yield _sse_event("message_start", {
-                "type": "message_start",
-                "message": {
-                    "id": msg_id, "type": "message", "role": "assistant",
-                    "model": model, "content": [],
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
-                },
-            })
+            # message_start, ilk GERCEK icerik gelene kadar ertelenir.
+            # Boylece upstream hicbir sey uretmezse sessizce bos "basarili" tur
+            # gondermek yerine temiz bir 'error' event'i yolluyoruz; aksi halde
+            # Claude Code ekranda hicbir sey gormeden Esc'e basana kadar bekliyordu.
+            started = False
+
+            async def start_msg():
+                nonlocal started
+                if started:
+                    return
+                started = True
+                yield _sse_event("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id, "type": "message", "role": "assistant",
+                        "model": model, "content": [],
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                })
 
             async def emit_block(kind: str, delta_txt: str, tool_name: str = "", tool_id: str = "", force: bool = False):
                 nonlocal block_type, block_index, tool_block_index
+                # ilk gercek icerik: onceden message_start'i gonder
+                async for ev in start_msg():
+                    yield ev
                 if block_type != kind or force:
                     if block_type is not None:
                         yield _sse_event("content_block_stop", {
@@ -1994,6 +2008,24 @@ async def anthropic_messages(request: Request):
                                       "message": f"stream {stall_s:.0f}s ver gelmeyince kapatildi"},
                         })
                         break
+                if not started:
+                    # Upstream HIC BIR SEY uretmedi (finish_reason=null,
+                    # output_tokens=0). Once sessizce bos "basarili" tur
+                    # gonderiyorduk; Claude Code ekranda hicbir sey
+                    # gormeden Esc'e basana kadar bekliyordu.
+                    # Artik retry edilebilir bir hata donuyoruz.
+                    DIAG["empty_stream_turns"] = DIAG.get("empty_stream_turns", 0) + 1
+                    print(f"[ox-gateway] BOS STREAM: '{model}' hicbir icerik uretmedi "
+                          f"(finish_reason={finish_reason}) -> error event")
+                    yield _sse_event("error", {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": ("upstream bos cevap dondurdu; "
+                                        "lutfen tekrar deneyin"),
+                        },
+                    })
+                    return
                 if block_type is not None:
                     yield _sse_event("content_block_stop", {
                         "type": "content_block_stop", "index": block_index})
