@@ -486,6 +486,70 @@ def _openai_content_to_text(content) -> str:
     return str(content)
 
 
+def _openai_images(content) -> list[dict]:
+    """OpenAI content listesindeki image_url parcalarini ham halde toplar."""
+    out: list[dict] = []
+    if not isinstance(content, list):
+        return out
+    for p in content:
+        if isinstance(p, dict) and p.get("type") == "image_url":
+            out.append(p)
+    return out
+
+
+def _openai_images_to_anthropic(parts: list[dict]) -> list[dict]:
+    """image_url parcalarini Anthropic image bloguna cevirir."""
+    out: list[dict] = []
+    for p in parts:
+        conv = _openai_part_to_anthropic(p)
+        if conv:
+            out.append(conv)
+    return out
+
+
+def _openai_part_to_anthropic(p: dict) -> dict | None:
+    """OpenAI content parcasini Anthropic bloguna cevirir (image_url dahil).
+
+    None donerse parca Anthropic formatinda tasinamiyor (sessizce dusurulur)."""
+    if not isinstance(p, dict):
+        return None
+    t = p.get("type")
+    if t == "text":
+        txt = p.get("text")
+        return {"type": "text", "text": txt} if txt else None
+    if t == "image_url":
+        iu = p.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else (iu if isinstance(iu, str) else None)
+        if not url:
+            return None
+        # data URI -> base64 kaynak
+        if url.startswith("data:"):
+            head, _, data = url.partition(",")
+            if not data:
+                return None
+            media = head[5:].split(";")[0] or "image/png"
+            return {"type": "image",
+                    "source": {"type": "base64", "media_type": media, "data": data}}
+        return {"type": "image", "source": {"type": "url", "url": url}}
+    return None
+
+
+def _openai_content_to_anthropic(content) -> Any:
+    """OpenAI content alanini Anthropic content'ine cevirir; gorselleri KORUR."""
+    if content is None or isinstance(content, str):
+        return content or ""
+    if isinstance(content, list):
+        blocks: list[dict] = []
+        for p in content:
+            conv = _openai_part_to_anthropic(p)
+            if conv:
+                blocks.append(conv)
+            elif isinstance(p, dict) and p.get("text"):
+                blocks.append({"type": "text", "text": p["text"]})
+        return blocks or ""
+    return str(content)
+
+
 def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
     """OpenAI chat payload'ini Atria (/v1/messages, Anthropic format) icin cevirir.
 
@@ -499,7 +563,10 @@ def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
 
     for m in msgs:
         role = (m.get("role") or "user").strip().lower()
-        text = _openai_content_to_text(m.get("content"))
+        raw_content = m.get("content")
+        text = _openai_content_to_text(raw_content)
+        # gorsel tasiyicisi: content listesindeki image_url parcalari
+        raw_images = _openai_images(raw_content)
 
         if role in ("system", "developer"):
             if text:
@@ -509,16 +576,20 @@ def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
         # ---- tool sonucu mesaji -> tool_result blogu ----
         if role == "tool":
             tid = m.get("tool_call_id") or ""
-            conv.append({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": tid, "content": text}],
-            })
+            rc: dict = {"type": "tool_result", "tool_use_id": tid, "content": text}
+            if raw_images:
+                conv.append({"role": "user",
+                             "content": [rc] + _openai_images_to_anthropic(raw_images)})
+            else:
+                conv.append({"role": "user", "content": [rc]})
             continue
 
         if role == "assistant":
             blocks: list[dict] = []
             if text:
                 blocks.append({"type": "text", "text": text})
+            if raw_images:
+                blocks.extend(_openai_images_to_anthropic(raw_images))
             for tc in m.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
@@ -544,7 +615,14 @@ def _openai_to_anthropic(payload_openai: dict, model: str) -> dict:
             continue
 
         # ---- user (ve digerleri) ----
-        conv.append({"role": "user", "content": text})
+        if raw_images:
+            blocks_u: list[dict] = []
+            if text:
+                blocks_u.append({"type": "text", "text": text})
+            blocks_u.extend(_openai_images_to_anthropic(raw_images))
+            conv.append({"role": "user", "content": blocks_u})
+        else:
+            conv.append({"role": "user", "content": text})
 
     if not conv:
         conv = [{"role": "user", "content": ""}]
@@ -1483,6 +1561,7 @@ def _anthropic_to_openai(body: dict) -> dict:
         thinking: list[str] = []
         tool_calls: list[dict] = []
         tool_results: list[tuple[str, str]] = []
+        images: list[dict] = []
 
         for b in c:
             if not isinstance(b, dict):
@@ -1494,6 +1573,19 @@ def _anthropic_to_openai(body: dict) -> dict:
             elif t == "thinking":
                 if b.get("thinking"):
                     thinking.append(b["thinking"])
+            elif t == "image":
+                # GORSEL: Anthropic image blogu -> OpenAI image_url
+                # (base64 -> data URI, url -> dogrudan). Onceki surumde
+                # SESSIZCE ATILIYORDU; model 'resim yok' diyordu.
+                src = b.get("source") or {}
+                st = src.get("type")
+                if st == "base64" and src.get("data"):
+                    mt = src.get("media_type") or "image/png"
+                    images.append({"type": "image_url",
+                                   "image_url": {"url": f"data:{mt};base64,{src['data']}"}})
+                elif st == "url" and src.get("url"):
+                    images.append({"type": "image_url",
+                                   "image_url": {"url": src["url"]}})
             elif t == "tool_use":
                 try:
                     args = json.dumps(b.get("input", {}), ensure_ascii=False)
@@ -1510,19 +1602,37 @@ def _anthropic_to_openai(body: dict) -> dict:
         # tool_result'lar ONCE gonderilir: OpenAI sirasi tool sonucu -> asistan
         if tool_results:
             for tid, txt in tool_results:
-                msgs.append({"role": "tool", "tool_call_id": tid, "content": txt})
+                if images:
+                    parts = [{"type": "text", "text": txt}] + images
+                    msgs.append({"role": "tool", "tool_call_id": tid, "content": parts})
+                else:
+                    msgs.append({"role": "tool", "tool_call_id": tid, "content": txt})
+        if images and not texts and not tool_calls:
+            # sadece gorsel geldi (metin tool_result icinde olabilir)
+            if not any(mm.get("content") for mm in msgs[-len(tool_results or [1]):]):
+                msgs.append({"role": role, "content": images})
         if texts or tool_calls:
             # tool_calls her zaman assistant'a ait; OpenAI role:"user" + tool_calls kabul etmez
-            assistant: dict = {"role": "assistant" if tool_calls else (role or "user"),
-                               "content": "\n".join(texts) or None}
-            if tool_calls:
-                assistant["tool_calls"] = tool_calls
-            msgs.append(assistant)
+            if images and not tool_calls:
+                # gorsel + metin birlikte: content dizisi olarak gonder
+                parts_msg: list[dict] = []
+                for tx in texts:
+                    parts_msg.append({"type": "text", "text": tx})
+                parts_msg.extend(images)
+                msgs.append({"role": role or "user", "content": parts_msg})
+            else:
+                assistant: dict = {"role": "assistant" if tool_calls else (role or "user"),
+                                   "content": "\n".join(texts) or None}
+                if tool_calls:
+                    assistant["tool_calls"] = tool_calls
+                msgs.append(assistant)
         elif tool_results:
             pass  # sadece tool_result vardi, yukarida eklendi
         elif thinking:
             # thinking-only tur: reasoning olarak koru, icerik uretmeden bos mesaj atma
             msgs.append({"role": role, "content": ""})
+        elif images:
+            msgs.append({"role": role, "content": images})
 
     out: dict = {"messages": msgs, "max_tokens": body.get("max_tokens") or 1024}
     if body.get("temperature") is not None:
