@@ -16,7 +16,7 @@
 | `start.bat` | Ön plan varyantı; `uvicorn` bu pencerede çalışır, `pause` yoktur. |
 | `stop-gateway.bat` | `py -3 supervisor.py --stop`. |
 | `sync_opencode.py` | OpenCode senkronizasyonu (§1.D). `--dry-run` / `--reset` destekler. |
-| `doctor.py` | Tek komutlu teşhis (§1.F). `--json` / `--quiet` / `--no-network` / `--timeout`. |
+| `doctor.py` | Tek komutlu teşhis, 14 kontrol (§1.F). `--json` / `--quiet` / `--no-network` / `--timeout`. Yeni: `stream` (boş akış), `silent_fallback` (istenen≠yanıtlayan model), `logrotate`. |
 | `bench.py` | Gecikme/güvenilirlik ölçümü (§1.G). `--n` / `--concurrency` / `--json` / `--out`. |
 | `static/index.html` | Dashboard: mod seçici, model seçici, key havuzu, chat testi, paralel agent. |
 | `agents.py` | Gateway client (`SubAgent`, `run_parallel`, `chat`). |
@@ -121,9 +121,11 @@ Rapor: **ne kuruldu / ne doğrulandı / geriye ne kaldı** (3 madde, uzatma).
 - **Reasoning:** `reasoning_max_tokens` (varsayılan 1024) gateway'in kendi düşünme bütçesidir; `0` kapatır. İstemci `thinking.budget_tokens` gönderdiyse o kazanır. `max_reasoning_budget` (2048) yalnızca *kötü tur* retry'sinde tavanı belirler.
 - **`degenerate_retry` varsayılan `false` ve kapalı kalmalı.** Açmak runaway döngü yaratır: 3448 karakterlik normal bir metin turu "bozuk" sayılıp 3 kez tekrar denendi, reasoning 3072 → 6144 → 12288'e tırmanıp tur 4 kat uzadı, tool çağrısı yine üretilmedi ve kota yendi. `doctor.py` bu ayarı açıkken WARN verir.
 - **429 davranışı:** Rate-limit cooldown `MAX_RATE_LIMIT_COOLDOWN_S=3600` (günlük limit 3 sn'de yeniden denenmez). `X-RateLimit-Reset` yoksa 60 sn.
-- **Graceful degradation:** Zincir tükenirse istemciye hata yerine geçerli cevap + `GRACEFUL_TEXT` döner; SSE akışları `event: error` / `data:[DONE]` ile kapanır, ASGI çökmez.
-- **Kasa dayanıklılığı:** `vault.json` okunamaz/çözülemezse sessiz boş liste dönülmez; dosya `vault.json.corrupt` olarak yedeklenir, yazma `503` ile durur. Bozuk kasayı silme/üzerine yazma — kullanıcı onayı ister.
+- **Graceful degradation:** İçerik **akmaya başladıktan sonra** akış koptuysa istemciye `GRACEFUL_TEXT` ile temiz kapanış yapılır. Hiçbir şey akmadan boş/hatalı tur gelirse sahte başarı **üretilmez**: `_RetryableUpstream` ile zincirdeki sonraki modele geçilir, hepsi başarısızsa tek `event: error` (non-stream: HTTP 502) döner. ASGI hiçbir yolda çökmez.
+- **Sessiz fallback görünür:** `/api/diag` → `last.model` **gerçek yanıtlayan** model, `last.requested_model` istemcinin istediği, `models_tried` denenenler. `doctor.py` "silent_fallback", `bench.py` `fallback` bayrağı bunu raporlar. `empty_stream_turns` boş/başarısız tur sayacıdır; `POST /api/diag/reset` sıfırlar.
+- **Kasa dayanıklılığı:** `vault.json` okunamır/çözülemezse sessiz boş liste dönülmez; dosya `vault.json.corrupt` olarak yedeklenir, yazma `503` ile durur. Bozuk kasayı silme/üzerine yazma — kullanıcı onayı ister.
 - **Anahtar taşıma:** Gateway api key'i `Authorization: Bearer` veya `x-api-key` header'ı ile kabul edilir; `?api_key=` **bilinçli olarak 401** ile reddedilir (URL'ler loglanır). Yalnızca `POST /api/rotate` değiştirir.
+- **Yönetim uçları auth ister:** `/mode/set`, `/provider/set`, `/protocol/set`, `/model/set`, `/keys/add`, `/keys/remove`, `/api/rotate`, `/agent/run`, `/agent/parallel` `check_auth` çağırır (header zorunluluğu tarayıcıdan gelen sürpriz POST'ları da engeller). Dashboard `jfetch` anahtarı **bellekte** tutar, `localStorage`'a yazmaz; 401'de bir kez tazeleyip tekrar dener. Okuma uçları (`/api/hello`, `/api/*`, `/v1/models`, `GET /keys`) bilinçli olarak auth'suz; `/api/conn` anahtarı döndürdüğü için bootstrap'ta korunamaz.
 
 ## 4) Sık Hatalar
 
@@ -141,7 +143,7 @@ Rapor: **ne kuruldu / ne doğrulandı / geriye ne kaldı** (3 madde, uzatma).
 | `sync_opencode.py` "gateway'e baglanilamadi" | Gateway ayakta değil | §1.B (`py -3 launcher.py`) |
 | Tüm key'ler aynı anda denendi | `_available()` cooldown doluysa hepsini aday yapar | Beklenen davranış; `rest_seconds`/`cooldown_every` ayarla |
 | `pytest` yok hatası | Regresyon paketi pytest değil stdlib unittest kullanıyor | `py -3 -m unittest discover -s tests -v` |
-| Regresyon paketi kırmızı çalışıyor | Kod kaynaklı gerçek hata, test hatası değil | Testi değiştirip kapatma; `gateway.py`'yi düzelt. Şu an 141/141 yeşil. |
+| Regresyon paketi kırmızı çalışıyor | Kod kaynaklı gerçek hata, test hatası değil | Testi değiştirip kapatma; `gateway.py`'yi düzelt. Şu an 189/189 yeşil. |
 | Upstream hata istemciye başarı görünüyor | `_anthropic_stop("error")` `end_turn` dönüyordu; `sse_anthropic` ve non-stream yolu sahte başarılı tur kuruyordu | `finish_reason=error` artık `_anthropic_stop` → `"error"` ve akış `event: error` / HTTP 502 veriyor |
 
 ## 5) Güvenlik
