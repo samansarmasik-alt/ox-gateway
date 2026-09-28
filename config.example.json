@@ -1,35 +1,37 @@
 {
   "model": "Atria-Dawn-Preview",
+  "active_mode": "1",
+  "provider_models": {
+    "1": "Atria-Dawn-Preview",
+    "2": "stealth/space-bunny-alpha"
+  },
+  "protocol": "openai",
+  "gateway_api_key": "",
+  "api_keys": [],
   "pace_ms": 100,
   "first_token_ms": 20000,
   "stall_timeout": 45,
-  "api_keys": [],
   "request_timeout": 120,
   "cooldown_seconds": 3,
   "cooldown_every": 3,
   "rest_seconds": 3,
   "max_retries": 3,
   "heal_retries": 2,
+  "graceful_degradation": true,
   "min_token_budget": 1024,
+  "max_token_budget": 32768,
   "token_budget_step": 2048,
   "token_budget_tries": 3,
-  "max_token_budget": 32768,
   "reasoning_max_tokens": 1024,
   "max_reasoning_budget": 2048,
   "degenerate_retry": false,
   "degenerate_token_floor": 64,
   "degenerate_char_ceiling": 400,
-  "graceful_degradation": true,
   "auto_model_fallback": true,
   "max_model_fallbacks": 4,
   "fallback_models": [
     "dots-studio/dots-3-note-preview:free",
     "liquid/lfm-2.5-2.6b:free",
     "nvidia/nemotron-3.5-lightning:free"
-  ],
-  "active_mode": "1",
-  "provider_models": {
-    "1": "Atria-Dawn-Preview",
-    "2": "stealth/space-bunny-alpha"
-  }
+  ]
 }
