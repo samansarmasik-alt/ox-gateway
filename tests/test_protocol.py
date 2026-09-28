@@ -341,11 +341,38 @@ class TestStopReasonMapping(unittest.TestCase):
                             "upstream hata bildirdi ama stop_reason=end_turn uretildi; "
                             "istemci hatayi gormuyor")
 
+    def test_anthropic_stop_error_maps_to_error_exactly(self):
+        """Sadece 'end_turn' degil OLMAYAN deger uretmeli.
+
+        Saglayici bu stop_reason'i gormeyen istemciler (opencode gibi)
+        icin tutarli bir hata isareti sart; yalnizca 'end_turn degil'
+        kontrolu bosa cikar.
+        """
+        self.assertEqual(gateway._anthropic_stop("error"), "error")
+
     def test_openai_finish_is_error(self):
         self.assertTrue(gateway._openai_finish_is_error("error"))
         for fin in ("stop", "tool_calls", "length", None, ""):
             with self.subTest(fin=fin):
                 self.assertFalse(gateway._openai_finish_is_error(fin))
+
+    def test_openai_finish_is_error_matches_only_exact_token(self):
+        """Esleme TAM 'error' ile yapilir; 'ERROR' hata sayilmaz."""
+        for fin in ("ERROR", "Error", " error", "error ", "errors", "err", "bilinmeyen"):
+            with self.subTest(fin=fin):
+                self.assertFalse(gateway._openai_finish_is_error(fin))
+
+    def test_error_flag_and_stop_mapping_stay_in_sync(self):
+        """Iki kopya ayrilirsa sahte basari geri gelir.
+
+        `_anthropic_stop` hata bildirdiginde 'error' donmeli; bu tam
+        olarak `_openai_finish_is_error` ile ayni kosula bagli olmali.
+        """
+        for fin in ("stop", "length", "tool_calls", "stop_sequence", "content_filter",
+                    "pause_turn", "refusal", None, "", "bilinmeyen", "error"):
+            with self.subTest(fin=fin):
+                self.assertEqual(gateway._anthropic_stop(fin) == "error",
+                                 gateway._openai_finish_is_error(fin))
 
 
 if __name__ == "__main__":

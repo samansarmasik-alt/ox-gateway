@@ -532,6 +532,56 @@ class TestAnthropicModelChainRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(last.get("requested_model"), "m1")
         # tum adaylar denenir (per_model'da tanimsiz olan da bos kabul edilir)
         self.assertEqual(last.get("models_tried"), ["m1", "m2", "m3"])
+        self.assertIsInstance(last.get("models_tried"), list, "models_tried liste olmali")
+        # model = cevap veremeyen son deneme; upstream_error neden oldu?
+        self.assertEqual(last.get("model"), "m3")
+        self.assertTrue(last.get("upstream_error"), "upstream_error dolu olmali")
+        self.assertNotEqual(last.get("model"), last.get("requested_model"))
+        self.assertEqual(last.get("path"), "/v1/messages")
+
+    async def test_diag_last_model_differs_from_requested_on_fallback(self):
+        """Zincirde yedek modele dusuldugunde model != requested_model.
+
+        doctor.py:463 ve bench.py:117 sessiz model degisimini BU ikisinin
+        farkindan anlar; basarili turde isaret (`empty_stream`) olmamali.
+        """
+        good = [
+            'data: {"choices":[{"delta":{"content":"yedekten cevap"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        calls, events = await self._run({"m1": ([], None), "m2": (good, None)})
+        self.assertEqual(calls, ["m1", "m2"])
+        self.assertIn("message_stop", [e for e, _ in events])
+        last = gateway.DIAG.get("last") or {}
+        self.assertEqual(last.get("requested_model"), "m1", "istemcinin istedigi")
+        self.assertEqual(last.get("model"), "m2", "gercekte cevap veren")
+        self.assertNotEqual(last.get("model"), last.get("requested_model"))
+        self.assertNotIn("empty_stream", last, "basarili tur bos-akis isaretlememeli")
+        self.assertTrue(last.get("has_text"))
+        self.assertEqual(last.get("stop_reason"), "end_turn")
+        self.assertEqual(gateway.DIAG.get("empty_stream_turns", 0), 0,
+                         "basarili yedek turu bos-akis saymamali")
+
+    async def test_diag_records_requested_model_on_midstream_failure(self):
+        """AKIS ORTASINDA kopma: `last` yine de model + requested_model tasi.
+
+        KAPSAM DISI DUZELTILME (bilinen hata): gateway.py:2210'daki kayit
+        `requested_model` icermiyor; bu yuzden doctor.py:469 sessiz model
+        degisimi kontrolunu bu turde "eski build" sanip atlıyor.
+        Test bilerek KIRMIZI birakildi: gateway.py duzeltilene kadar yesil
+        olmamalidir.
+        """
+        import httpx as _h
+        partial = ['data: {"choices":[{"delta":{"content":"yarim"}}]}']
+        calls, _ = await self._run({"m1": (partial, _h.ReadError("koptu"))},
+                                  candidates=("m1",))
+        self.assertEqual(calls, ["m1"])
+        last = gateway.DIAG.get("last") or {}
+        self.assertIn("mid_stream_error", last, "bu kayit akis ortasindaki hata olmali")
+        self.assertEqual(last.get("model"), "m1")
+        self.assertEqual(last.get("requested_model"), "m1")
+        self.assertTrue(last.get("has_text"))
 
     async def test_no_retry_once_content_already_streamed(self):
         """Icerik aktiktan sonra kopma -> YENIDEN DENEMEZ (icerik tekrar etmez)."""
@@ -548,6 +598,96 @@ class TestAnthropicModelChainRetry(unittest.IsolatedAsyncioTestCase):
         texts = [d["delta"].get("text", "") for d in deltas]
         # graceful metin satir basinda gelir
         self.assertEqual(texts, ["yarim", "\n" + gateway.GRACEFUL_TEXT])
+
+
+class TestNonStreamErrorTurn(unittest.IsolatedAsyncioTestCase):
+    """Non-stream /v1/messages: sahte basarili tur YASAK.
+
+    Upstream 200 donup icerik uretmezse istemci 200 + bos content +
+    stop_reason=end_turn gormemeli; 502 alip yeniden denemeli
+    (bkz. gateway.py:2302).
+    """
+
+    def setUp(self):
+        self._diag = dict(gateway.DIAG)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        gateway.DIAG.clear()
+        gateway.DIAG.update(self._diag)
+
+    @staticmethod
+    def _openai_reply(message, finish="stop"):
+        return {"id": "cmpl_1", "object": "chat.completion",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+
+    async def _post(self, upstream_reply):
+        """Sahte call_openrouter ile non-stream /v1/messages cagrisi."""
+        transport = httpx.ASGITransport(app=gateway.app)
+        with mock.patch.object(gateway, "_should_route_atria", return_value=False), \
+             mock.patch.object(gateway, "call_openrouter",
+                               new=mock.AsyncMock(return_value=upstream_reply)):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                         timeout=10) as ac:
+                return await ac.post("/v1/messages", json={
+                    "model": "m1", "max_tokens": 256, "stream": False,
+                    "messages": [{"role": "user", "content": "selam"}]},
+                    headers={"x-api-key": gateway.GATEWAY_KEY})
+
+    async def test_ok_turn_returns_200_with_blocks(self):
+        """Kontrol: dolu cevap 200 döner, stop_reason=end_turn."""
+        r = await self._post(self._openai_reply(
+            {"role": "assistant", "content": "merhaba"}))
+        self.assertEqual(r.status_code, 200)
+        j = r.json()
+        self.assertEqual(j["content"], [{"type": "text", "text": "merhaba"}])
+        self.assertEqual(j["stop_reason"], "end_turn")
+        self.assertEqual(j["usage"]["output_tokens"], 4)
+        self.assertEqual(j["model"], "m1")
+
+    async def test_tool_only_turn_is_not_empty(self):
+        """Yalnizca tool_call ureten tur de gecerli bir turdur (502 YASAK)."""
+        r = await self._post(self._openai_reply({
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"Izmir"}'}}],
+        }, finish="tool_calls"))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["stop_reason"], "tool_use")
+        self.assertEqual(r.json()["content"][0]["type"], "tool_use")
+
+    async def test_finish_reason_error_raises_502(self):
+        """finish_reason=error: sahte basari degil, acik hata."""
+        r = await self._post(self._openai_reply(
+            {"role": "assistant", "content": "yarim cevap"}, finish="error"))
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("bos/hatali", r.json()["detail"])
+        self.assertNotIn("content", r.json(), "hata govdesinde sahte turn olmamali")
+
+    async def test_error_finish_counts_empty_stream_turn(self):
+        before = gateway.DIAG.get("empty_stream_turns", 0)
+        r = await self._post(self._openai_reply({"role": "assistant", "content": "x"},
+                                                finish="error"))
+        self.assertEqual(r.status_code, 502)
+        self.assertEqual(gateway.DIAG.get("empty_stream_turns", 0), before + 1)
+
+    async def test_no_content_blocks_raises_502(self):
+        """Blok uretilmeyen cevap 502 vermeli.
+
+        KAPSAM DISI DUZELTILME (bilinen hata): gateway.py:1833 bos icerige
+        `{"type":"text","text":""}` yer tutucusu dondurdugu icin
+        gateway.py:2302'deki `not blocks` kontrolu HICBIR zaman dogru
+        degil; istemci 200 + bos content + end_turn goruyor.
+        Test bilerek KIRMIZI birakildi.
+        """
+        for icerik in ("", None):
+            with self.subTest(content=icerik):
+                r = await self._post(self._openai_reply(
+                    {"role": "assistant", "content": icerik}))
+                self.assertEqual(r.status_code, 502,
+                                 "upstream hicbir blok uretmediyse sahte basari donulmemeli")
+                self.assertNotIn("stop_reason", r.json())
 
 
 if __name__ == "__main__":

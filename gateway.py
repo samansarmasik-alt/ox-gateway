@@ -1833,6 +1833,28 @@ def _openai_to_anthropic_blocks(message: dict) -> list[dict]:
     return blocks or [{"type": "text", "text": ""}]
 
 
+def _anthropic_blocks_are_empty(blocks: list[dict] | None) -> bool:
+    """Cevap gercekten icerik uretti mi?
+
+    _openai_to_anthropic_blocks bos cevapta yer tutucu olarak
+    [{"type":"text","text":""}] dondurur; bu yuzden sadece `not blocks`
+    kontrolu HICBIR ZAMAN dogru olmazdi ve upstream bos cevap verince
+    istemciye sahte basarili tur gidiyordu. Yer tutucunun kendisini
+    taniyoruz.
+    """
+    if not blocks:
+        return True
+    for b in blocks:
+        t = b.get("type")
+        if t == "tool_use":
+            return False
+        if t == "thinking" and (b.get("thinking") or "").strip():
+            return False
+        if t == "text" and (b.get("text") or "").strip():
+            return False
+    return True
+
+
 def _sse_event(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
@@ -2210,6 +2232,7 @@ async def anthropic_messages(request: Request):
                 _diag({
                     "path": "/v1/messages", "mode": get_active_mode(),
                     "provider": get_provider()["name"], "model": cand_model,
+                    "requested_model": model,
                     "finish_reason": finish_reason, "stop_reason": stop_reason,
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
@@ -2299,7 +2322,7 @@ async def anthropic_messages(request: Request):
     blocks = _openai_to_anthropic_blocks(msg)
     u = result.get("usage", {})
     finish = result["choices"][0].get("finish_reason")
-    if _openai_finish_is_error(finish) or not blocks:
+    if _openai_finish_is_error(finish) or _anthropic_blocks_are_empty(blocks):
         # Upstream hata bildirdiyse veya hicbir blok uretmediyse sahte
         # basarili bir donus yapmayiz; istemci hatayi gorup yeniden
         # denesin. (Daha oncesi: stop_reason=end_turn + bos content ->
@@ -2309,6 +2332,26 @@ async def anthropic_messages(request: Request):
               f"finish_reason={finish} blok={len(blocks)} -> hata")
         raise HTTPException(status_code=502, detail=(
             "upstream bos/hatali cevap dondurdu; lutfen tekrar deneyin"))
+    # Basarili non-stream tur da diag'a yazilir. Once yalnizca streaming
+    # yol kayd ediyordu; bu yuzden non-stream istemcilerinde 'turns'
+    # sayaci ilerlemiyor, 'last' bayat kaliyor ve sessiz fallback
+    # gorunemiyordu.
+    _diag({
+        "path": "/v1/messages",
+        "stream": False,
+        "mode": get_active_mode(),
+        "provider": get_provider()["name"],
+        "model": model,
+        "requested_model": model,
+        "client_max_tokens": body.get("max_tokens"),
+        "sent_max_tokens": payload.get("max_tokens"),
+        "finish_reason": finish,
+        "stop_reason": _anthropic_stop(finish),
+        "text_chars": sum(len(b.get("text") or "") for b in blocks
+                          if b.get("type") == "text"),
+        "tool_uses": sum(1 for b in blocks if b.get("type") == "tool_use"),
+        "output_tokens": u.get("completion_tokens", 0),
+    })
     return {
         "id": "msg_" + str(result.get("id", "")),
         "type": "message",

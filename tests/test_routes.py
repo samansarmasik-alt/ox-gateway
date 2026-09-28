@@ -129,8 +129,26 @@ class TestDiagRoute(RouteTest):
         r = await self.req("GET", "/api/diag")
         self.assertEqual(r.status_code, 200)
         j = r.json()
-        for alan in ("turns", "empty_turns", "truncated_turns", "last", "model"):
+        for alan in ("turns", "empty_turns", "empty_stream_turns", "truncated_turns",
+                     "last", "model", "active_mode", "provider"):
             self.assertIn(alan, j)
+        for sayac in ("turns", "empty_turns", "empty_stream_turns", "truncated_turns"):
+            self.assertIsInstance(j[sayac], int, f"{sayac} tam sayi olmali")
+
+    async def test_diag_reports_empty_stream_turns(self):
+        """Bos-akis sayaci ayri alan: /api/diag bos akislari GORMELI.
+
+        Onceki surumde sayac hic artmiyordu, bu yuzden doctor.py ve
+        bench.py 'sessiz basarisiz tur' sinyalini hic yakalayamiyordu.
+        """
+        eski = dict(gateway.DIAG)
+        try:
+            gateway.DIAG["empty_stream_turns"] = 4
+            j = (await self.req("GET", "/api/diag")).json()
+            self.assertEqual(j["empty_stream_turns"], 4)
+        finally:
+            gateway.DIAG.clear()
+            gateway.DIAG.update(eski)
 
     async def test_diag_reset_restores_state(self):
         eski = dict(gateway.DIAG)
@@ -138,12 +156,20 @@ class TestDiagRoute(RouteTest):
             gateway.DIAG["turns"] = 7
             gateway.DIAG["empty_turns"] = 3
             gateway.DIAG["truncated_turns"] = 2
+            gateway.DIAG["empty_stream_turns"] = 5
             r = await self.req("POST", "/api/diag/reset")
             self.assertEqual(r.status_code, 200)
             self.assertTrue(r.json()["reset"])
             self.assertEqual(gateway.DIAG["turns"], 0)
             self.assertEqual(gateway.DIAG["empty_turns"], 0)
+            self.assertEqual(gateway.DIAG["truncated_turns"], 0)
+            self.assertEqual(gateway.DIAG["empty_stream_turns"], 0,
+                             "reset bos-akis sayacini da sifirlamali")
             self.assertIsNone(gateway.DIAG["last"])
+            # sifirlama dis yuzeye de yansimali
+            j = (await self.req("GET", "/api/diag")).json()
+            self.assertEqual(j["empty_stream_turns"], 0)
+            self.assertIsNone(j["last"])
         finally:
             gateway.DIAG.clear()
             gateway.DIAG.update(eski)

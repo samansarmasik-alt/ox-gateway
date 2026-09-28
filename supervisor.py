@@ -28,6 +28,73 @@ LOGFILE = os.path.join(LOGS, "gateway.log")
 PIDFILE = os.path.join(LOGS, "gateway.pid")
 STOPFILE = os.path.join(LOGS, "gateway.stop")
 
+# Log rotasyonu. Tum log append-only idi, sınırsiz buyuyordu.
+# Windows'ta uvicorn log handle'ini bize mirasten aliyor ve her zaman acik
+# tutuyor; acik dosyayi os.replace() ile yeniden adlandirmak PermissionError
+# verir. Bu yuzden rotasyon YALNIZ uvicorn kapaliyken, yani supervisor'in
+# dosyayi tek sahibi oldugu anda uygulanir (cocugu oldurmeden).
+ROTATE_BYTES = 8 * 1024 * 1024   # aktif log bu esigi gecince dondurulur
+ROTATE_KEEP = 3                  # kac nesil tutulur: gateway.log.1 .. .3
+ROTATE_TRY = 6                   # dosya kilitliyse kac kez yeniden denenir
+ROTATE_TRY_WAIT = 0.1            # bekleme (saniye), toplam en fazla ~0.5 sn
+
+_child_running = False   # uvicorn ayaktayken log dosyasi kilitli
+_rotate_pending = False  # esik asildi, cocuk kapaninca uygulanacak
+_rotate_day = time.strftime("%Y-%m-%d")
+
+
+def rotate_log(logfile: str = LOGFILE, keep: int = ROTATE_KEEP) -> bool:
+    """gateway.log -> .1, eski nesiller kayar, en eskisi yok edilir.
+
+    True donerse dondu, False donerse kilitli/kirpilti: cagiran taraf
+    bunu bir kez loglar ve birakir. Icerik sadece dosyadan dosyaya
+    tasinir, hicbir sekilde okunmaz/bastirilmaz.
+    """
+    if not os.path.exists(logfile):
+        return False
+    for attempt in range(ROTATE_TRY):
+        try:
+            # .2 -> .3, .1 -> .2  (en eski uzerine yazilir = silinir)
+            for i in range(keep - 1, 0, -1):
+                src = f"{logfile}.{i}"
+                if os.path.exists(src):
+                    os.replace(src, f"{logfile}.{i + 1}")
+            os.replace(logfile, f"{logfile}.1")
+        except OSError:
+            # doctor.py/editor dosyayi bir an tutuyor olabilir; kisa bekle.
+            if attempt + 1 < ROTATE_TRY:
+                time.sleep(ROTATE_TRY_WAIT)
+                continue
+            return False
+        with open(logfile, "a", encoding="utf-8"):
+            pass  # yeni aktif dosya bos olusur
+        return True
+    return False
+
+
+def maybe_rotate() -> None:
+    """Esik veya gun degisti mi, uvicorn kapali mi diye bakar, dondurur."""
+    global _rotate_pending, _rotate_day
+    day = time.strftime("%Y-%m-%d")
+    if not _rotate_pending:
+        if day == _rotate_day:
+            try:
+                if os.path.getsize(LOGFILE) < ROTATE_BYTES:
+                    return
+            except OSError:
+                return
+        _rotate_pending = True
+    if _child_running:
+        return  # handle cocukta: bir sonraki supervisor yazisinda uygulanir
+    # default parametre degil, anlik global: LOGFILE/ROTATE_KEEP testte
+    # gecici dizine yonlendirilse bile dogru dosyaya bakilir.
+    if rotate_log(LOGFILE, ROTATE_KEEP):
+        _rotate_pending = False
+        _rotate_day = day
+        log(f"log donduruldu ({ROTATE_BYTES} bayt esigi, {ROTATE_KEEP} nesil)")
+    else:
+        log("log dondurulemedi (dosya kilitli) - sonraki denemeye birakildi")
+
 
 def log(msg: str) -> None:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -138,6 +205,7 @@ def do_stop() -> int:
 
 
 def main() -> int:
+    global _child_running
     os.makedirs(LOGS, exist_ok=True)
     if port_busy():
         log("port 8756 zaten dolu - supervisor cikis yapiyor (cift instance)")
@@ -155,6 +223,7 @@ def main() -> int:
                 log("stop dosyasi bulundu - supervisor kapaniyor")
                 return 0
             started = time.time()
+            maybe_rotate()  # uvicorn yokken dosya kilitsiz: dondurmanin zamani
             with open(LOGFILE, "a", encoding="utf-8", errors="replace") as out:
                 out.write(f"\n===== uvicorn baslatildi {time.strftime('%H:%M:%S')} "
                           f"(supervisor PID {os.getpid()}) =====\n")
@@ -166,7 +235,11 @@ def main() -> int:
                     stdin=subprocess.DEVNULL,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
-                code = proc.wait()
+                _child_running = True
+                try:
+                    code = proc.wait()
+                finally:
+                    _child_running = False
             lived = time.time() - started
             if os.path.exists(STOPFILE):
                 log("stop dosyasi bulundu - supervisor kapaniyor")

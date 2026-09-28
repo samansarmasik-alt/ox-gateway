@@ -69,6 +69,12 @@ LOG_SIGS = (
     ("http_500", '" 500 ', "HTTP 500"),
 )
 
+# supervisor.py:36-37 ile ayni rotasyon sabitleri. Rotasyon yalniz uvicorn
+# kapaliyken olur; bu yuzden aktif log .1..N nesilleriyle birlikte yasar.
+ROTATE_BYTES = 8 * 1024 * 1024
+ROTATE_KEEP = 3
+ROTATE_NEAR = 0.9            # aktif logun bu oranini gecmesi = "dondurulmeye yakin"
+
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 CHECKS: list[dict] = []
 
@@ -193,6 +199,40 @@ def _int(val, default: int = 0) -> int:
         return int(val)
     except (TypeError, ValueError):
         return default
+
+
+def human(num: int) -> str:
+    """Bayt -> okunur. Negatif/mirasiz girdi 0 sayilir."""
+    n = max(0, _int(num))
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def log_generations() -> list[tuple[int, int]]:
+    """gateway.log.1 .. .N -> [(n, byte)], n ascending. Hata durumunda bos."""
+    out: list[tuple[int, int]] = []
+    try:
+        found = list(LOG_DIR.glob(LOG_PATH.name + ".*"))
+    except OSError:
+        return out
+    for p in found:
+        tail = p.name.rsplit(".", 1)[-1]
+        if not tail.isdigit():
+            continue
+        try:
+            out.append((int(tail), p.stat().st_size))
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def scrub(text) -> str:
+    """Upstream hata metni gibi dis kaynakli stringlerdeki olasi sir maskesi."""
+    t = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9_\-.]{8,}", r"\1***", str(text))
+    return re.sub(r"\b(sk-[A-Za-z0-9_\-]{6,})", "sk-***", t)
 
 
 def cfg_set(key: str, value) -> str:
@@ -354,7 +394,8 @@ def check_api() -> dict:
     else:
         turns, empty = _int(diag.get("turns")), _int(diag.get("empty_turns"))
         trunc, last = _int(diag.get("truncated_turns")), diag.get("last") or {}
-        det.append(f"diag · tur {turns} · bos {empty} · kirpilan {trunc}")
+        est = _int(diag.get("empty_stream_turns"))
+        det.append(f"diag · tur {turns} · bos {empty} · bos akis {est} · kirpilan {trunc}")
         if last:
             det.append(f"son tur · {last.get('path')} · {last.get('stop_reason')} · "
                        f"metin {last.get('text_chars')} · think {last.get('think_chars')}"
@@ -370,6 +411,82 @@ def check_api() -> dict:
         "py -3 supervisor.py --stop; py -3 launcher.py" if fails
         else ("Get-Content logs\\gateway.log -Tail 40" if warns else ""))
     return {"conn": conn, "stats": stats, "diag": diag}
+
+
+def check_stream_health(api: dict) -> None:
+    """/api/diag bos-akis sayaci: flakiness'nin en erken belirtisi.
+
+    `empty_stream_turns` eskiden hep 0 idi (bos-akis yolu hicbir sey saymadan
+    donuyordu). Artik guvenilir: bir tur bos akiste kaldiginda zincir ya baska
+    modele dustu ya da istemci `event: error` / 502 aldi. Bu kontrol yalnizca
+    WARN verir: sayaclar surec basindan birikiyor, payda 1-2 turken oran
+    anlamsiz oldugu icin FAIL esigi buradan sagli kiyi amak.
+    """
+    NAME, MEASURE = "bos akis sayaci", "py -3 bench.py"
+    diag = api.get("diag")
+    if diag is None:
+        add("stream", NAME, SKIP, ["/api/diag okunamadi, sayac alinamadi"])
+        return
+    if "empty_stream_turns" not in diag:
+        add("stream", NAME, SKIP, ["bu gateway surumunde empty_stream_turns yok (eski build)"])
+        return
+    turns = _int(diag.get("turns"))
+    est, emp = _int(diag.get("empty_stream_turns")), _int(diag.get("empty_turns"))
+    det = [f"bos akis {est} turda · bos cevap {emp} · toplam {turns}"]
+    warns: list[str] = []
+    if est:
+        det.append(f"son bos akis: empty_stream={bool((diag.get('last') or {}).get('empty_stream'))}")
+        symptom = ("zincir diger modele dustu (sessiz fallback)"
+                   if len((diag.get("last") or {}).get("models_tried") or []) > 1
+                   else "zincir tukendi, istemci 'event: error' / 502 aldi")
+        warns.append(f"{est} tur bos akiste kaldi -> {symptom}")
+        if turns:
+            warns.append(f"bos akis orani %{round(est / turns * 100)} ({est}/{turns}) · "
+                         f"olc: {MEASURE}")
+    if emp:
+        det.append(f"bos cevap orani %{round(emp / turns * 100)}" if turns else "bos cevap orani: (tur yok)")
+        if turns >= 4 and emp / turns >= 0.25:
+            warns.append(f"turlerin %{round(emp / turns * 100)}'i bos cevapla bitti "
+                         f"({emp}/{turns}) · olc: {MEASURE}")
+    if not est and not emp:
+        det.append("bos akis/bos cevap yok: fallback modeli su an stabil")
+    add("stream", NAME, WARN if warns else PASS, det + warns, MEASURE if warns else "")
+
+
+def check_silent_fallback(api: dict) -> None:
+    """Istedigin model mi yanit verdi? `last.requested_model` vs `last.model`."""
+    NAME, MEASURE = "sessiz model degisimi", "py -3 bench.py"
+    last = (api.get("diag") or {}).get("last") or {}
+    if not last:
+        add("silent_fallback", NAME, SKIP, ["/api/diag yok ya da henuz tur islenmedi"])
+        return
+    req, used = last.get("requested_model"), last.get("model")
+    tried = [str(m) for m in (last.get("models_tried") or []) if m]
+    if not req and not tried:
+        # last.model tek basina yetmez: kimin istedigini bilmeden "degisim yok"
+        # demek utopik olur. Eski build'lerde bu alanlar yok.
+        add("silent_fallback", NAME, SKIP,
+            ["bu gateway surumunde last.requested_model yok (eski build); "
+             "sessiz fallback olculemez"])
+        return
+    det = [f"istediğin: {req or '(bilinmiyor)'} · yanit veren: {used or '(model yok)'}"]
+    if tried:
+        det.append(f"denenen zincir ({len(tried)}): " + ", ".join(tried[:6]))
+    if last.get("empty_stream"):
+        det.append("son tur bos akiste bitti (empty_stream=True)")
+    if last.get("upstream_error"):
+        det.append(f"upstream hatasi: {scrub(last['upstream_error'])[:120]}")
+    warns: list[str] = []
+    if req and used and str(req) != str(used):
+        warns.append(f"sessiz fallback: istedin {req}, yanit veren {used}")
+    if len(tried) > 1:
+        warns.append(f"zincir {len(tried)} model denedi: {tried[0]} calismadi, "
+                     f"istenen modele ulasilmadi · olc: {MEASURE}")
+    if last.get("empty_stream") and not used:
+        warns.append("hicbir model yanit vermedi; istemci hata aldi")
+    if not warns:
+        det.append("istenen model ile yanitlayan model ayni: sessiz degisim yok")
+    add("silent_fallback", NAME, WARN if warns else PASS, det + warns, MEASURE if warns else "")
 
 
 def check_keys(api: dict) -> None:
@@ -544,12 +661,32 @@ def check_reasoning(cfg: dict) -> None:
 
 
 
+def newest_log() -> tuple[pathlib.Path, str]:
+    """Imza taramasi icin okunacak dosya: aktif log, yoksa en yeni nesil.
+
+    supervisor.py rotasyonu aktif logu bos birakir (rotate_log yeni dosyayi
+    append ile acar). O bos dosyada imza yoktur; icerik gateway.log.1'e
+    tasinmistir. Rotasyon sonrasi tarama cokmemeli.
+    """
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size:
+            return LOG_PATH, ""
+    except OSError:
+        pass
+    gens = log_generations()
+    if gens:
+        src = LOG_DIR / f"{LOG_PATH.name}.{gens[0][0]}"   # kucuk numara = en yeni
+        return src, f"aktif log bos/yok -> imza taramasi {src.name} uzerinde"
+    return LOG_PATH, ""
+
+
 def check_logs() -> None:
-    if not LOG_PATH.exists():
+    src, note = newest_log()
+    if not src.exists():
         add("logs", "log sagligi", WARN, [f"{LOG_PATH.name} yok (supervisor ile baslatilmamis?)"],
             "py -3 launcher.py")
         return
-    lines = tail_lines(LOG_PATH)
+    lines = tail_lines(src)
     if not lines:
         add("logs", "log sagligi", WARN, ["log dosyasi bos"])
         return
@@ -558,7 +695,9 @@ def check_logs() -> None:
     named = {cid: label for cid, _, label in LOG_SIGS}
     counts = {cid: text.lower().count(needle.lower()) for cid, needle, _ in LOG_SIGS}
     now = {cid: recent.lower().count(needle.lower()) for cid, needle, _ in LOG_SIGS}
-    det = [f"son {len(lines)} satir ({len(lines[-200:])} su anki kosu) · {LOG_PATH.name}"]
+    det = [f"son {len(lines)} satir ({len(lines[-200:])} su anki kosu) · {src.name}"]
+    if note:
+        det.append(note)
     det += [f"  {named[cid]}: {n}" + ("  <-- su anki kosuda" if now.get(cid) else "")
             for cid, n in sorted(counts.items(), key=lambda kv: -kv[1]) if n]
     det.append(f"  HTTP 4xx access: {len(re.findall(r'\" 4\d\d ', text))} · "
@@ -571,6 +710,56 @@ def check_logs() -> None:
     st = FAIL if fatal else (WARN if (rec or sum(counts[c] for c in FATAL)) else PASS)
     add("logs", "log sagligi", st, det,
         "Get-Content logs\\gateway.log -Tail 60" if st in (FAIL, WARN) else "")
+
+
+def check_log_rotation() -> None:
+    """supervisor.py rotasyonu: aktif log + gateway.log.1..N ayak izi.
+
+    rotate_log yalniz uvicorn kapaliyken calistigi icin aktif log esigi assa bile
+    cocuk durana kadar buyumeye devam eder; bu yuzden "aktif log buyuk" tek
+    basina hata degil, onemsiz bilgidir. .1 var olmasi da tek basina FAIL
+    degildir: normalde beklenen durumdur.
+    """
+    NAME = "log rotasyonu"
+    gens = log_generations()
+    gen_total = sum(s for _, s in gens)
+    try:
+        active: int | None = LOG_PATH.stat().st_size
+    except FileNotFoundError:
+        active = None
+    except OSError as e:
+        add("logrotate", NAME, WARN, [f"{LOG_PATH.name} okunamadi: {e}"])
+        return
+    cap = ROTATE_BYTES * (ROTATE_KEEP + 1)     # 3 nesil + 1 aktif = tasarim tavantisi
+    det = []
+    if active is None:
+        det.append(f"{LOG_PATH.name} yok"
+                   + (f" ama {len(gens)} nesil arsiv var (supervisor yazmiyor olabilir)"
+                      if gens else " (supervisor ile baslatilmamis?)"))
+    else:
+        det.append(f"aktif {LOG_PATH.name} {human(active)} · dondurme esigi "
+                   f"{human(ROTATE_BYTES)} (%{round(active / ROTATE_BYTES * 100)})")
+    if gens:
+        det.append(f"donmus nesil {len(gens)} (supervisor {ROTATE_KEEP} tutar) · toplam "
+                   f"{human(gen_total)} · " + ", ".join(f".{n}={human(s)}" for n, s in gens))
+    else:
+        det.append("donmus nesil yok (henuz rotasyon olmadi)")
+    det.append(f"toplam ayak izi {human((active or 0) + gen_total)} · tasarim tavantisi {human(cap)}")
+    warns: list[str] = []
+    if active is None and not gens:
+        warns.append(f"{LOG_PATH.name} yok: supervisor loglamiyor ya da hic baslamadi")
+    if active is not None and active >= ROTATE_BYTES * ROTATE_NEAR:
+        warns.append(f"aktif log dondurme esigine yakin/uzerinde: supervisor uvicorn "
+                     f"durdurunce dondurecek ({human(ROTATE_BYTES)} esigi)")
+    if (active or 0) + gen_total > cap:
+        warns.append(f"toplam log {human((active or 0) + gen_total)} > {human(cap)}: "
+                     f"disk/okuma maliyeti buyuyor")
+    if len(gens) > ROTATE_KEEP:
+        warns.append(f"{len(gens)} nesil var ama rotate_log sadece {ROTATE_KEEP} tutuyor; "
+                     f"fazlalikler kendiliginden silinmez")
+    add("logrotate", NAME, WARN if warns else PASS, det + warns,
+        f"Remove-Item {LOG_DIR.name}\\{LOG_PATH.name}.{ROTATE_KEEP + 1}"
+        if len(gens) > ROTATE_KEEP else "")
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +844,15 @@ def main(argv: list[str] | None = None) -> int:
     run("owner", "port sahibi biz miyiz", check_owner, pid)
     run("supervisor", "supervisor canliligi", check_supervisor)
     api = run("api", "api uclari", check_api) or {}
+    run("stream", "bos akis sayaci", check_stream_health, api)
+    run("silent_fallback", "sessiz model degisimi", check_silent_fallback, api)
     run("keys", "key havuzu", check_keys, api)
     fb = run("fallbacks", "free yedek zinciri", check_fallbacks, cfg) or []
     run("opencode", "opencode.json (ox)", check_opencode, cfg, api, fb)
     run("claude", "claude settings", check_claude, api, cfg)
     run("reasoning", "reasoning ayarlari", check_reasoning, cfg)
     run("logs", "log sagligi", check_logs)
+    run("logrotate", "log rotasyonu", check_log_rotation)
 
 
     if args.json:
