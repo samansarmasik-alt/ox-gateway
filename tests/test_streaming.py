@@ -222,7 +222,15 @@ class TestAnthropicEmptyStream(unittest.IsolatedAsyncioTestCase, AnthropicStream
             gateway.DIAG.update(old)
 
     async def test_open_stream_raises_graceful_stream_still_terminates(self):
-        """Upstream hiç acilmazsa ASGI cokmez: akis graceful metinle biter."""
+        """Upstream hic acilmazsa ASGI cokmez ve akis DUZGUN sonlanir.
+
+        Bilincli davranis degisikligi: once model zincirinde hata olunca
+        sagli cevap gibi gorunen GRACEFUL_TEXT akitiliyordu; bu, upstream
+        hatayi istemciden gizliyordu. Artik:
+          - zincirdeki tum modeller denenir (bizim ekledigimiz retry)
+          - hepsi acilamazsa TEK bir 'error' event'i uretilir
+        Testin asil amaci olan "ASGI cokmez, akis temiz kapanir" korunur.
+        """
         transport = httpx.ASGITransport(app=gateway.app)
         with mock.patch.object(gateway, "open_stream",
                                new=mock.AsyncMock(side_effect=RuntimeError("kapali"))), \
@@ -236,8 +244,12 @@ class TestAnthropicEmptyStream(unittest.IsolatedAsyncioTestCase, AnthropicStream
                     "messages": [{"role": "user", "content": "selam"}],
                 }, headers={"x-api-key": gateway.GATEWAY_KEY}) as r:
                     self.assertEqual(r.status_code, 200)
-                    names = [e for e, _ in parse_sse([ln async for ln in r.aiter_lines()])]
-        self.assertIn("message_stop", names)
+                    events = [e for e, _ in parse_sse([ln async for ln in r.aiter_lines()])]
+        # Akis tek bir terminal event ile bitti: sahte basari YOK.
+        self.assertEqual(events[-1], "error")
+        self.assertNotIn("message_stop", events)
+        # message_start uretilmemis olmali (hicbir icerik akmadi).
+        self.assertNotIn("message_start", events)
 
 
 class TestAnthropicStreamContent(unittest.IsolatedAsyncioTestCase, AnthropicStreamMixin):
@@ -396,6 +408,146 @@ class TestOpenAIStreamSurface(unittest.IsolatedAsyncioTestCase):
         self.assertIn("oldu", [d.get("content") for d in deltas if d.get("content")])
         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(lines[-1], "data: [DONE]")
+
+
+class TestAnthropicModelChainRetry(unittest.IsolatedAsyncioTestCase):
+    """Zincir uzerinde retry: hicbir sey akmadan basarisiz olunan deneme
+    bir sonraki modele gecmeli, hepsi basarisizsa TEK hata event'i olmali.
+
+    Bu yol gercek hayatta sik goruluyor: space-bunny gunluk limite girince
+    gateway free yedeklere geciyor ve nvidia/nemotron bazen HTTP 200 + 0
+    icerik + finish_reason=error donuyordu.
+    """
+
+    def setUp(self):
+        self._diag = dict(gateway.DIAG)
+        # sayaci sifirla: mutlak deger degil, BU testin katkisi olcumlenir
+        gateway.DIAG["empty_stream_turns"] = 0
+
+    def tearDown(self):
+        gateway.DIAG.clear()
+        gateway.DIAG.update(self._diag)
+
+    async def _run(self, per_model, candidates=("m1", "m2", "m3")):
+        """per_model: {model: (lines, after_exc|None)} veya model -> Exception"""
+        calls = []
+
+        async def fake_open(payload, m):
+            calls.append(m)
+            spec = per_model.get(m)
+            if isinstance(spec, Exception):
+                raise spec
+            lines, after = spec
+            return _upstream(lines, after)
+
+        transport = httpx.ASGITransport(app=gateway.app)
+        with mock.patch.object(gateway, "open_stream", new=fake_open), \
+             mock.patch.object(gateway, "_should_route_atria", return_value=False), \
+             mock.patch.object(gateway, "_candidate_models",
+                               new=mock.AsyncMock(return_value=list(candidates))):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                         timeout=10) as ac:
+                async with ac.stream("POST", "/v1/messages", json={
+                    "model": "m1", "max_tokens": 512, "stream": True,
+                    "messages": [{"role": "user", "content": "selam"}],
+                }, headers={"x-api-key": gateway.GATEWAY_KEY}) as r:
+                    self.assertEqual(r.status_code, 200)
+                    return calls, parse_sse([ln async for ln in r.aiter_lines()])
+
+    async def test_empty_stream_falls_through_to_next_model(self):
+        """1. model hicbir sey uretmiyor -> 2. model basarili."""
+        good = [
+            'data: {"choices":[{"delta":{"content":"Merhaba"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        calls, events = await self._run({"m1": ([], None), "m2": (good, None)})
+        names = [e for e, _ in events]
+        self.assertEqual(calls, ["m1", "m2"], "ikinci modele gecmeliydi")
+        self.assertIn("message_start", names)
+        self.assertIn("message_stop", names)
+        self.assertNotIn("error", names, "basarili cevapta hata olmamali")
+        deltas = events_named(events, "content_block_delta")
+        self.assertIn("Merhaba", [d["delta"]["text"] for d in deltas])
+
+    async def test_upstream_error_finish_falls_through_to_next_model(self):
+        """finish_reason=error -> sahte basari degil, sonraki modele gec."""
+        err_stream = [
+            'data: {"choices":[{"delta":{},"finish_reason":"error"}]}',
+            "data: [DONE]",
+        ]
+        good = [
+            'data: {"choices":[{"delta":{"content":"tamam"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        calls, events = await self._run({"m1": (err_stream, None), "m2": (good, None)})
+        self.assertEqual(calls, ["m1", "m2"])
+        names = [e for e, _ in events]
+        self.assertIn("message_stop", names)
+        self.assertNotIn("error", names)
+
+    async def test_connection_error_falls_through_to_next_model(self):
+        """Baglanti kurulamazsa (ConnectionError) sonraki model denenir."""
+        good = [
+            'data: {"choices":[{"delta":{"content":"ok"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        calls, events = await self._run(
+            {"m1": OSError("baglanti yok"), "m2": (good, None)})
+        self.assertEqual(calls, ["m1", "m2"])
+        self.assertIn("message_stop", [e for e, _ in events])
+
+    async def test_midstream_drop_before_content_retries(self):
+        """Icerik hic baslamadan koptuysa (ReadError) tekrar denenir."""
+        import httpx as _h
+        good = [
+            'data: {"choices":[{"delta":{"content":"ok"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        calls, events = await self._run(
+            {"m1": ([], _h.ReadError("koptu")), "m2": (good, None)})
+        self.assertEqual(calls, ["m1", "m2"])
+        self.assertIn("message_stop", [e for e, _ in events])
+
+    async def test_all_models_fail_yields_single_error_event(self):
+        """Zincir tukendi -> TEK error event'i, sahte basari YOK, ASGI cokmez."""
+        calls, events = await self._run(
+            {"m1": ([], None), "m2": ([], None), "m3": ([], None)})
+        names = [e for e, _ in events]
+        self.assertEqual(calls, ["m1", "m2", "m3"], "tum modeller denenmeliydi")
+        self.assertEqual(names.count("error"), 1, "tam olarak bir hata olmali")
+        self.assertEqual(names[-1], "error")
+        self.assertNotIn("message_stop", names)
+        self.assertNotIn("message_start", names)
+        self.assertEqual(gateway.DIAG.get("empty_stream_turns", 0), 1)
+
+    async def test_diag_records_models_tried_on_total_failure(self):
+        _, events = await self._run({"m1": ([], None), "m2": ([], None)})
+        self.assertEqual(events[-1][0], "error")
+        last = gateway.DIAG.get("last") or {}
+        self.assertTrue(last.get("empty_stream"))
+        self.assertEqual(last.get("requested_model"), "m1")
+        # tum adaylar denenir (per_model'da tanimsiz olan da bos kabul edilir)
+        self.assertEqual(last.get("models_tried"), ["m1", "m2", "m3"])
+
+    async def test_no_retry_once_content_already_streamed(self):
+        """Icerik aktiktan sonra kopma -> YENIDEN DENEMEZ (icerik tekrar etmez)."""
+        import httpx as _h
+        partial = [
+            'data: {"choices":[{"delta":{"content":"yarim"}}]}',
+        ]
+        calls, events = await self._run(
+            {"m1": (partial, _h.ReadError("koptu")), "m2": ([], None)})
+        self.assertEqual(calls, ["m1"], "icerik aktiktan sonra tekrar denenmemeli")
+        names = [e for e, _ in events]
+        self.assertIn("message_stop", names)
+        deltas = events_named(events, "content_block_delta")
+        texts = [d["delta"].get("text", "") for d in deltas]
+        # graceful metin satir basinda gelir
+        self.assertEqual(texts, ["yarim", "\n" + gateway.GRACEFUL_TEXT])
 
 
 if __name__ == "__main__":

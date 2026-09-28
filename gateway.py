@@ -1796,6 +1796,19 @@ def _anthropic_stop(finish: str | None) -> str:
     return _ANTHROPIC_STOP.get(finish or "stop", "end_turn")
 
 
+class _RetryableUpstream(Exception):
+    """Deneme basarisiz ama istemciye HICBIR sey gonderilmedi.
+
+    Bu durumda sarmalayici guvenle bir sonraki modele gecebilir: mesaj
+    basligi (message_start) ilk gercek icerik gelene kadar ertelendigi icin
+    istemci tarafinda kopuk/yarim akis izi kalmaz.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _openai_finish_is_error(finish: str | None) -> bool:
     """Upstream streaming'te finish_reason olarak 'error' verdiyse hata budur."""
     return finish == "error"
@@ -1972,32 +1985,17 @@ async def anthropic_messages(request: Request):
     if body.get("stream"):
         payload["stream"] = True
 
-        async def sse_anthropic():
-            # Response baslamadan once hata cikabilir; response basladiktan
-            # SONRA HTTPException firlatmak ASGI'yi cokertir. Bunun yerine
-            # hatayi Anthropic-uyumlu SSE error event'i olarak akiyoruz.
-            # Streaming bos/error cevap verirse (freemodel bazen 0 icerikle
-            # finish_reason=error donuyor) BIR SONRAKI modele gec.
-            # message_start ertelendigi icik bu noktada guvenli: istemciye
-            # hicbir sey gonderilmemis oluyor.
-            cands = await _candidate_models(model)
-            try_idx = 0
-            while True:
-                try:
-                    cand_model = cands[try_idx] if try_idx < len(cands) else model
-                    client, resp, line_iter, first_line = await open_stream(
-                        {**payload, "model": cand_model}, cand_model)
-                    break
-                except Exception:
-                    try_idx += 1
-                    if try_idx < len(cands):
-                        print(f"[ox-gateway] stream acilamadi, sonraki modele gecildi "
-                              f"(deneme {try_idx + 1}/{len(cands)})")
-                        continue
-                    # Hata asla agante iletilmez: gecerli minimal bir basarili akis uretilir
-                    for chunk in _anthropic_graceful_events():
-                        yield chunk
-                    return
+        async def _sse_attempt(cand_model: str):
+            # Tek bir modele tek deneme. Hicbir sey istemciye gonderilmeden
+            # basarisiz olursa _RetryableUpstream firlatir; sarmalayici
+            # bir sonraki modele gecer. Bir sey gonderildikten sonra hata
+            # olursa ASGI cokmesin diye graceful kapanis yapar.
+            try:
+                client, resp, line_iter, first_line = await open_stream(
+                    {**payload, "model": cand_model}, cand_model)
+            except Exception as e:
+                raise _RetryableUpstream(
+                    f"upstream baglantisi kurulamadi ({type(e).__name__})") from e
             # thinking ve text icin AYRI bloklar; her tool_call da kendi blogunda
             block_type: str | None = None   # None | "thinking" | "text" | "tool_use"
             block_index = -1
@@ -2157,41 +2155,18 @@ async def anthropic_messages(request: Request):
                 if not started or upstream_error:
                     # Upstream HIC BIR SEY uretmedi (finish_reason=null,
                     # output_tokens=0) ya da akis sonunda hata bildirdi.
-                    # Once sessizce bos "basarili" tur gonderiyorduk; Claude
-                    # Code ekranda hicbir sey gormeden Esc'e basana kadar
-                    # bekliyordu. Artik retry edilebilir bir hata donuyoruz.
+                    # Istemciye hicbir sey gonderilmedigi icin guvenle BIR
+                    # SONRAKI MODELE GECEBILIRIZ: sarmalayici bunu yakalayip
+                    # zincirdeki diger modelleri dener.
                     # NOT: 'error' finish_reason'i icerik varken bile hata
                     # sayilir; yarim cevap sessizce basari gibi sunulmaz.
-                    DIAG["empty_stream_turns"] = DIAG.get("empty_stream_turns", 0) + 1
                     print(f"[ox-gateway] BOS STREAM: '{cand_model}' hicbir icerik "
                           f"uretmedi (finish_reason={finish_reason}"
-                          f"{', upstream_error' if upstream_error else ''}) "
-                          f"-> error event")
-                    # Bu tur _diag'a hic ugramadan donuyordu; o yuzden
-                    # /api/diag 'turns' sayaci ilerlemiyor ve hata gorusur
-                    # oluyordu. Artik kayda giriyoruz.
-                    _diag({
-                        "path": "/v1/messages",
-                        "mode": get_active_mode(),
-                        "provider": get_provider()["name"],
-                        "model": cand_model,
-                        "requested_model": model,
-                        "client_max_tokens": body.get("max_tokens"),
-                        "sent_max_tokens": payload.get("max_tokens"),
-                        "finish_reason": finish_reason,
-                        "empty_stream": True,
-                        "upstream_error": upstream_error,
-                    })
-                    yield _sse_event("error", {
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": (upstream_error or
-                                        "upstream bos cevap dondurdu; "
-                                        "lutfen tekrar deneyin"),
-                        },
-                    })
-                    return
+                          f"{', upstream_error' if upstream_error else ''})"
+                          f" -> sonraki modele geciliyor")
+                    raise _RetryableUpstream(
+                        upstream_error or
+                        f"upstream bos cevap dondurdu (finish_reason={finish_reason})")
                 if block_type is not None:
                     yield _sse_event("content_block_stop", {
                         "type": "content_block_stop", "index": block_index})
@@ -2218,8 +2193,16 @@ async def anthropic_messages(request: Request):
                     "has_text": text_chars > 0,
                     "has_tool_use": tool_count > 0,
                 })
+            except _RetryableUpstream:
+                # kendi bos/error durumumuz; yukarida firlatildi
+                raise
             except Exception as e:
-                # Akis ORTASINDA koptu (icerik baslamisti) -> temiz graceful kapanis
+                # Akis ORTASINDA koptu.
+                if not started:
+                    # Henuz hicbir sey gonderilmedi -> guvenle baska modele geç.
+                    raise _RetryableUpstream(
+                        f"upstream baglantisi koptu ({type(e).__name__})") from e
+                # Icerik baslamisti -> ASGI cokmesin diye temiz graceful kapanis
                 print(f"[ox-gateway] stream ortasinda hata, graceful kapanis: {e}")
                 _diag({
                     "path": "/v1/messages", "mode": get_active_mode(),
@@ -2254,6 +2237,52 @@ async def anthropic_messages(request: Request):
             finally:
                 await resp.aclose()
                 await client.aclose()
+
+        async def sse_anthropic():
+            # Model zinciri uzerinden tekrar dener. Bir deneme istemciye HICBIR
+            # sey gondermeden basarisiz olursa (_RetryableUpstream) siradaki
+            # modele geceriz. message_start ertelendigi icin bu guvenli.
+            # Tum modeller bos/error donerse TEK bir hata event'i uretilir.
+            cands = await _candidate_models(model)
+            last_err: str | None = None
+            last_model: str | None = None
+            for idx, cand in enumerate(cands):
+                try:
+                    async for chunk in _sse_attempt(cand):
+                        yield chunk
+                    return
+                except _RetryableUpstream as e:
+                    last_err = e.reason
+                    last_model = cand
+                    if idx + 1 < len(cands):
+                        print(f"[ox-gateway] '{cand}' basarisiz ({e.reason}) -> "
+                              f"sonraki modele geciliyor "
+                              f"({idx + 2}/{len(cands)}: {cands[idx + 1]})")
+                        continue
+            # Hicbir model ise yaramadi: istemciye acik hata don.
+            DIAG["empty_stream_turns"] = DIAG.get("empty_stream_turns", 0) + 1
+            print(f"[ox-gateway] TUM MODELLER BASARISIZ ({len(cands)} deneme) "
+                  f"-> error event. Son hata: {last_err}")
+            _diag({
+                "path": "/v1/messages",
+                "mode": get_active_mode(),
+                "provider": get_provider()["name"],
+                "model": last_model,
+                "requested_model": model,
+                "client_max_tokens": body.get("max_tokens"),
+                "sent_max_tokens": payload.get("max_tokens"),
+                "empty_stream": True,
+                "models_tried": cands,
+                "upstream_error": last_err,
+            })
+            yield _sse_event("error", {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": (f"tum modellerden bos/hatali cevap geldi "
+                                f"({last_err}); lutfen tekrar deneyin"),
+                },
+            })
 
         return StreamingResponse(
             sse_anthropic(),
