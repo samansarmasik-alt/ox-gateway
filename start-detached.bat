@@ -35,7 +35,9 @@ REM pythonw.exe = KONSOLSZ. Gorunur terminal acilmaz, o pencere de kapanir.
 REM >>>/>>2&1 KRITIK: bu yonlendirme olmadan arka plandaki surec ebeveynin
 REM stdout pipe'ini acik tutuyor ve cagiran shell (orn. agent terminali)
 REM hic kapanmiyor. Yonlendirme ile cikis akisi serbest birakiliyor.
-start "" /b cmd /c ""%PY%" "%~dp0supervisor.py" >>"%~dp0logs\supervisor.out" 2>&1"
+REM NOT: "start /b cmd /c" sarmalayicisi KULLANILMAZ; her calistirmada
+REM artik bir cmd.exe birikiyordu. Dogrudan pythonw.calistiriliyor.
+start "" /b "%PY%" "%~dp0supervisor.py" >>"%~dp0logs\supervisor.out" 2>&1
 
 REM supervisor + uvicorn ayaga kalkana kadar bekle (en fazla 15 sn)
 REM NOT: 'timeout' konsolsuz shell'de "Input redirection is not supported"
