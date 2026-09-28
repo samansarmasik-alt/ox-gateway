@@ -1408,7 +1408,8 @@ def get_gateway_key() -> str:
 
 
 @app.post("/api/rotate")
-async def rotate_gateway_key():
+async def rotate_gateway_key(request: Request):
+    check_auth(request)
     """SADECE bu cagri ile gateway api key yenilenir; aksi halde sabit kalir."""
     global GATEWAY_KEY
     GATEWAY_KEY = "ox-" + secrets.token_urlsafe(32)
@@ -1485,7 +1486,8 @@ async def providers_info():
 
 @app.post("/mode/set")
 @app.post("/provider/set")
-async def set_mode(req: ModeSetRequest):
+async def set_mode(req: ModeSetRequest, request: Request):
+    check_auth(request)
     """Aktif provider/modu degistirir; kalici kaydedilir. Eski keyler korunur."""
     m = str(req.mode).strip()
     if m not in ("1", "2"):
@@ -1511,7 +1513,8 @@ class ProtocolSetRequest(BaseModel):
 
 
 @app.post("/protocol/set")
-async def set_protocol(req: ProtocolSetRequest):
+async def set_protocol(req: ProtocolSetRequest, request: Request):
+    check_auth(request)
     """Tek tusla protokol degistirimi; kalici kaydedilir."""
     p = req.protocol.strip().lower()
     if p not in ("openai", "anthropic"):
@@ -2326,7 +2329,8 @@ class KeyAddRequest(BaseModel):
 
 
 @app.post("/keys/add")
-async def keys_add(req: KeyAddRequest):
+async def keys_add(req: KeyAddRequest, request: Request):
+    check_auth(request)
     if VAULT_ERROR:
         raise HTTPException(503, f"Kasa okunamadi, yazma yapilmadi: {VAULT_ERROR}")
     m = str(req.mode or get_active_mode())
@@ -2342,7 +2346,8 @@ class KeyRemoveRequest(BaseModel):
 
 
 @app.post("/keys/remove")
-async def keys_remove(req: KeyRemoveRequest):
+async def keys_remove(req: KeyRemoveRequest, request: Request):
+    check_auth(request)
     if VAULT_ERROR:
         raise HTTPException(503, f"Kasa okunamadi, yazma yapilmadi: {VAULT_ERROR}")
     m = str(req.mode or get_active_mode())
@@ -2425,7 +2430,8 @@ class ModelSetRequest(BaseModel):
 
 
 @app.post("/model/set")
-async def set_model(req: ModelSetRequest):
+async def set_model(req: ModelSetRequest, request: Request):
+    check_auth(request)
     m = str(req.mode or get_active_mode())
     if m not in ("1", "2"):
         raise HTTPException(400, "mod 1 veya 2 olmali")
@@ -2649,7 +2655,8 @@ async def chat_completions(request: Request, req: ChatRequest):
 
 
 @app.post("/agent/run")
-async def agent_run(req: AgentRequest):
+async def agent_run(req: AgentRequest, request: Request):
+    check_auth(request)
     """Tek sub-agent: system + task -> cevap metni."""
     payload: dict = {
         "messages": [
@@ -2671,7 +2678,8 @@ async def agent_run(req: AgentRequest):
 
 
 @app.post("/agent/parallel")
-async def agent_parallel(req: ParallelAgentRequest):
+async def agent_parallel(req: ParallelAgentRequest, request: Request):
+    check_auth(request)
     """N sub-agent'i paralel calistirir; round-robin ile keylere dagilir."""
     sem = asyncio.Semaphore(req.max_concurrency)
 

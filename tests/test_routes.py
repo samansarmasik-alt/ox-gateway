@@ -279,11 +279,11 @@ class TestModeRoutes(ConfigGuardMixin, RouteTest):
     async def test_invalid_mode_400(self):
         for yol in ("/mode/set", "/provider/set"):
             with self.subTest(yol=yol):
-                r = await self.req("POST", yol, json={"mode": "3"})
+                r = await self.req("POST", yol, json={"mode": "3"}, headers=self.key())
                 self.assertEqual(r.status_code, 400)
 
     async def test_missing_field_422(self):
-        r = await self.req("POST", "/mode/set", json={})
+        r = await self.req("POST", "/mode/set", json={}, headers=self.key())
         self.assertEqual(r.status_code, 422)
 
     async def test_set_mode_updates_config_without_writing_disk(self):
@@ -291,7 +291,7 @@ class TestModeRoutes(ConfigGuardMixin, RouteTest):
         kaydedilen: list = []
         with mock.patch.object(gateway, "load_config", return_value=dict(gateway.CONFIG)), \
              mock.patch.object(gateway, "save_config", side_effect=kaydedilen.append):
-            r = await self.req("POST", "/mode/set", json={"mode": hedef})
+            r = await self.req("POST", "/mode/set", json={"mode": hedef}, headers=self.key())
         self.assertEqual(r.status_code, 200)
         j = r.json()
         self.assertTrue(j["set"])
@@ -306,7 +306,7 @@ class TestModeRoutes(ConfigGuardMixin, RouteTest):
         hedef = "2" if gateway.get_active_mode() == "1" else "1"
         with mock.patch.object(gateway, "load_config", return_value=dict(gateway.CONFIG)), \
              mock.patch.object(gateway, "save_config") as sc:
-            r = await self.req("POST", "/provider/set", json={"mode": hedef})
+            r = await self.req("POST", "/provider/set", json={"mode": hedef}, headers=self.key())
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["active_mode"], hedef)
         sc.assert_called_once()
@@ -318,11 +318,11 @@ class TestModeRoutes(ConfigGuardMixin, RouteTest):
             self.skipTest("config'de provider_models eksik")
         with mock.patch.object(gateway, "load_config", return_value=dict(gateway.CONFIG)), \
              mock.patch.object(gateway, "save_config"):
-            r = await self.req("POST", "/mode/set", json={"mode": hedef})
+            r = await self.req("POST", "/mode/set", json={"mode": hedef}, headers=self.key())
         self.assertEqual(r.json()["model"], beklenen)
 
     async def test_protocol_set_validation(self):
-        r = await self.req("POST", "/protocol/set", json={"protocol": "ftp"})
+        r = await self.req("POST", "/protocol/set", json={"protocol": "ftp"}, headers=self.key())
         self.assertEqual(r.status_code, 400)
 
 
@@ -331,15 +331,59 @@ class TestMiscRoutes(RouteTest):
         self.assertEqual((await self.req("GET", "/api/boyle-bir-yol-yok")).status_code, 404)
 
     async def test_model_set_validation(self):
-        self.assertEqual((await self.req("POST", "/model/set", json={"model": " "})).status_code,
+        self.assertEqual((await self.req("POST", "/model/set", json={"model": " "}, headers=self.key())).status_code,
                          400)
-        self.assertEqual((await self.req("POST", "/model/set", json={"mode": "9", "model": "m"})
+        self.assertEqual((await self.req("POST", "/model/set", json={"mode": "9", "model": "m"}, headers=self.key())
                           ).status_code, 400)
 
     async def test_rotate_requires_explicit_call(self):
         """Anahtar sadece /api/rotate ile degisir; testlerde cagrilmiyor."""
         r = await self.req("GET", "/api/rotate")
         self.assertEqual(r.status_code, 405)
+
+
+class TestAdminRoutesRequireAuth(RouteTest):
+    """Yonetim ve agent uclari zorunlu anahtar ister.
+
+    Gerekce: gateway 127.0.0.1'e bagli olsa bile header zorunlulugu
+    tarayici tarafindan gonderilen "basit" POST'lari engeller (CORS
+    preflight). Aksi halde kullanicinin gezdiggi herhangi bir sayfa
+    localhost'a POST atip anahtar degistirebilir (/api/rotate) veya
+    key harcamasi yapabilirdi (/keys/add, /agent/*).
+    """
+
+    YOLLAR = (
+        ("POST", "/mode/set", {"mode": "1"}),
+        ("POST", "/provider/set", {"mode": "1"}),
+        ("POST", "/protocol/set", {"protocol": "anthropic"}),
+        ("POST", "/model/set", {"model": "x"}),
+        ("POST", "/keys/add", {"key": "x", "mode": "1"}),
+        ("POST", "/keys/remove", {"key": "x"}),
+        ("POST", "/api/rotate", None),
+        ("POST", "/agent/run", {"task": "selam"}),
+        ("POST", "/agent/parallel", {"agents": [{"task": "selam"}]}),
+    )
+
+    async def test_all_admin_routes_reject_missing_key(self):
+        for method, yol, body in self.YOLLAR:
+            with self.subTest(yol=yol):
+                r = await self.req(method, yol, json=body)
+                self.assertEqual(r.status_code, 401,
+                                 f"{yol} anahtarsiz kabul edilmemeli")
+
+    async def test_all_admin_routes_reject_wrong_key(self):
+        kotu = {"x-api-key": "ox-yanlis-anahtar"}
+        for method, yol, body in self.YOLLAR:
+            with self.subTest(yol=yol):
+                r = await self.req(method, yol, json=body, headers=kotu)
+                self.assertEqual(r.status_code, 401,
+                                 f"{yol} yanlis anahtari kabul etmemeli")
+
+    async def test_query_string_key_still_rejected(self):
+        """?api_key= bilincli olarak reddedilir (URL'ler loglanir)."""
+        r = await self.req("POST", f"/mode/set?api_key={gateway.GATEWAY_KEY}",
+                           json={"mode": "1"})
+        self.assertEqual(r.status_code, 401)
 
 
 class TestLiveGateway(unittest.TestCase):

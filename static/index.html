@@ -180,8 +180,39 @@ function toast(msg) {
   setTimeout(() => t.classList.remove("show"), 2600);
 }
 
+// Gateway anahtari. Yalnizca BELLEKTE tutulur; localStorage/sessionStorage'a
+// yazilmaz. Yonetim uclari (mode/set, keys/*, api/rotate, agent/*) artik
+// zorunlu header istiyor: tarayicida baska bir sayfa localhost'a POST atip
+// anahtari degistiremesin diye.
+let GKEY = "";
+
+async function ensureKey() {
+  if (GKEY) return GKEY;
+  try {
+    const r = await fetch(API + "/api/conn");
+    if (r.ok) GKEY = (await r.json()).gateway_api_key || "";
+  } catch {}
+  return GKEY;
+}
+
 async function jfetch(url, opts) {
+  opts = opts || {};
+  await ensureKey();
+  opts.headers = Object.assign({}, opts.headers, {"x-api-key": GKEY});
   const r = await fetch(url, opts);
+  if (r.status === 401 && GKEY) {
+    // Anahtar rotate edildiyse ya da sayfa uzun sure acik kaldiysa bir kez tazele
+    GKEY = "";
+    await ensureKey();
+    opts.headers = Object.assign({}, opts.headers, {"x-api-key": GKEY});
+    const retry = await fetch(url, opts);
+    if (!retry.ok) {
+      let m2 = retry.status;
+      try { const j2 = await retry.json(); m2 = j2.detail || JSON.stringify(j2); } catch {}
+      throw new Error(m2);
+    }
+    return retry.json();
+  }
   if (!r.ok) {
     let msg = r.status;
     try { const j = await r.json(); msg = j.detail || JSON.stringify(j); } catch {}
