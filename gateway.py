@@ -1450,6 +1450,7 @@ async def diag():
         "model": get_active_model(),
         "turns": DIAG["turns"],
         "empty_turns": DIAG["empty_turns"],
+        "empty_stream_turns": DIAG.get("empty_stream_turns", 0),
         "truncated_turns": DIAG["truncated_turns"],
         "last": DIAG["last"],
     }
@@ -1460,6 +1461,7 @@ async def diag_reset():
     DIAG["turns"] = 0
     DIAG["empty_turns"] = 0
     DIAG["truncated_turns"] = 0
+    DIAG["empty_stream_turns"] = 0
     DIAG["last"] = None
     return {"reset": True}
 
@@ -1680,10 +1682,9 @@ def _anthropic_to_openai(body: dict) -> dict:
                     msgs.append({"role": "tool", "tool_call_id": tid, "content": parts_t})
                 else:
                     msgs.append({"role": "tool", "tool_call_id": tid, "content": txt})
-        if images and not texts and not tool_calls:
-            # sadece gorsel geldi (metin tool_result icinde olabilir)
-            if not any(mm.get("content") for mm in msgs[-len(tool_results or [1]):]):
-                msgs.append({"role": role, "content": images})
+        # NOTE: burada ayri bir "sadece gorsel" blogu YOK; asagidaki elif
+        # zinciri zaten bu durumu ele aliyor. Onceki hali ayni mesaji iki
+        # kez ekliyordu (gorsel 2 kez gidiyor, maliyet 2x).
         if texts or tool_calls:
             # tool_calls her zaman assistant'a ait; OpenAI role:"user" + tool_calls kabul etmez
             if images and not tool_calls:
@@ -1705,7 +1706,8 @@ def _anthropic_to_openai(body: dict) -> dict:
             # thinking-only tur: reasoning olarak koru, icerik uretmeden bos mesaj atma
             msgs.append({"role": role, "content": ""})
         elif images:
-            msgs.append({"role": role, "content": images})
+            # sadece gorsel: tek mesaj, tek kez
+            msgs.append({"role": role or "user", "content": images})
 
     out: dict = {"messages": msgs,
                  "max_tokens": _clamp_max_tokens(body.get("max_tokens"))}
@@ -1781,12 +1783,17 @@ def _openai_finish(stop_reason: str | None) -> str:
 
 
 def _anthropic_stop(finish: str | None) -> str:
-    # "error" bilincli olarak end_turn DEGIL: upstream hata bildirince sahte
-    # basarili tur uretmek, istemciye (Claude Code) hata yerine bos/bitmis
-    # cevap gosteriyordu. end_turn'a eslenirse agent hatayi fark edemiyor.
-    if finish in (None, "", "error"):
-        return "end_turn"
-    return _ANTHROPIC_STOP.get(finish, "end_turn")
+    """OpenAI finish_reason -> Anthropic stop_reason.
+
+    'error' icin END_TURN DONDURME. Upstream hata bildirdiginde istemciye
+    sahte basarili tur gondermek, Claude Code'un hatayi hic fark etmemesine
+    yol aciyordu (ekran bos kalip "esc interrupt"e kadar bekliyordu).
+    Upstream'in hata sinyali 'error' ise acik bir hata isareti donuyoruz;
+    cagiran taraf bunu kontrol edip hata event'i uretmeli.
+    """
+    if _openai_finish_is_error(finish):
+        return "error"
+    return _ANTHROPIC_STOP.get(finish or "stop", "end_turn")
 
 
 def _openai_finish_is_error(finish: str | None) -> bool:
@@ -1999,6 +2006,7 @@ async def anthropic_messages(request: Request):
             stop_reason = "end_turn"
             usage_out = 0
             finish_reason = None
+            upstream_error: str | None = None
             text_chars = 0
             think_chars = 0
             tool_count = 0
@@ -2120,6 +2128,13 @@ async def anthropic_messages(request: Request):
                             if fr:
                                 finish_reason = fr
                                 stop_reason = _anthropic_stop(fr)
+                                if _openai_finish_is_error(fr):
+                                    # Upstream hata bildirdi: bunu sahte basarili
+                                    # tur gibi sunmak istemciyi bos ekrana
+                                    # birakyordu. Akisi kesip hata event'i
+                                    # uretecegiz (asagida).
+                                    upstream_error = ("upstream akis sonunda "
+                                                      "hata bildirdi")
                             if ct:
                                 text_chars += len(ct)
                             if rt:
@@ -2139,20 +2154,40 @@ async def anthropic_messages(request: Request):
                                       "message": f"stream {stall_s:.0f}s ver gelmeyince kapatildi"},
                         })
                         break
-                if not started:
+                if not started or upstream_error:
                     # Upstream HIC BIR SEY uretmedi (finish_reason=null,
-                    # output_tokens=0). Once sessizce bos "basarili" tur
-                    # gonderiyorduk; Claude Code ekranda hicbir sey
-                    # gormeden Esc'e basana kadar bekliyordu.
-                    # Artik retry edilebilir bir hata donuyoruz.
+                    # output_tokens=0) ya da akis sonunda hata bildirdi.
+                    # Once sessizce bos "basarili" tur gonderiyorduk; Claude
+                    # Code ekranda hicbir sey gormeden Esc'e basana kadar
+                    # bekliyordu. Artik retry edilebilir bir hata donuyoruz.
+                    # NOT: 'error' finish_reason'i icerik varken bile hata
+                    # sayilir; yarim cevap sessizce basari gibi sunulmaz.
                     DIAG["empty_stream_turns"] = DIAG.get("empty_stream_turns", 0) + 1
-                    print(f"[ox-gateway] BOS STREAM: '{model}' hicbir icerik uretmedi "
-                          f"(finish_reason={finish_reason}) -> error event")
+                    print(f"[ox-gateway] BOS STREAM: '{cand_model}' hicbir icerik "
+                          f"uretmedi (finish_reason={finish_reason}"
+                          f"{', upstream_error' if upstream_error else ''}) "
+                          f"-> error event")
+                    # Bu tur _diag'a hic ugramadan donuyordu; o yuzden
+                    # /api/diag 'turns' sayaci ilerlemiyor ve hata gorusur
+                    # oluyordu. Artik kayda giriyoruz.
+                    _diag({
+                        "path": "/v1/messages",
+                        "mode": get_active_mode(),
+                        "provider": get_provider()["name"],
+                        "model": cand_model,
+                        "requested_model": model,
+                        "client_max_tokens": body.get("max_tokens"),
+                        "sent_max_tokens": payload.get("max_tokens"),
+                        "finish_reason": finish_reason,
+                        "empty_stream": True,
+                        "upstream_error": upstream_error,
+                    })
                     yield _sse_event("error", {
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": ("upstream bos cevap dondurdu; "
+                            "message": (upstream_error or
+                                        "upstream bos cevap dondurdu; "
                                         "lutfen tekrar deneyin"),
                         },
                     })
@@ -2170,7 +2205,8 @@ async def anthropic_messages(request: Request):
                     "path": "/v1/messages",
                     "mode": get_active_mode(),
                     "provider": get_provider()["name"],
-                    "model": model,
+                    "model": cand_model,
+                    "requested_model": model,
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
                     "finish_reason": finish_reason,
@@ -2231,6 +2267,16 @@ async def anthropic_messages(request: Request):
     blocks = _openai_to_anthropic_blocks(msg)
     u = result.get("usage", {})
     finish = result["choices"][0].get("finish_reason")
+    if _openai_finish_is_error(finish) or not blocks:
+        # Upstream hata bildirdiyse veya hicbir blok uretmediyse sahte
+        # basarili bir donus yapmayiz; istemci hatayi gorup yeniden
+        # denesin. (Daha oncesi: stop_reason=end_turn + bos content ->
+        # Claude Code ekranda hicbir sey gormeden bekliyordu.)
+        DIAG["empty_stream_turns"] = DIAG.get("empty_stream_turns", 0) + 1
+        print(f"[ox-gateway] BOS CEVAP (non-stream): '{model}' "
+              f"finish_reason={finish} blok={len(blocks)} -> hata")
+        raise HTTPException(status_code=502, detail=(
+            "upstream bos/hatali cevap dondurdu; lutfen tekrar deneyin"))
     return {
         "id": "msg_" + str(result.get("id", "")),
         "type": "message",
