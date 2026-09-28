@@ -1338,6 +1338,13 @@ async def dashboard():
     return {"service": "ox-gateway", "model": get_active_model(), "keys": len(active_pool().keys)}
 
 
+@app.api_route("/api/hello", methods=["GET", "HEAD"])
+async def api_hello():
+    """Saglik ucu. Istemciler (opencode vb.) HEAD /api/hello ile dogrulama
+    yapiyordu; 404 dondugu icin gateway 'ulasilmaz' saniliyordu."""
+    return {"ok": True, "service": "ox-gateway", "mode": get_active_mode()}
+
+
 @app.get("/api/stats")
 async def api_stats(mode: str | None = None):
     """Dashboard'un canlı dinlediği özet (aktif mod + tum modlarin ozeti)."""
@@ -1570,6 +1577,29 @@ def _block_images(b: dict) -> list[dict]:
     return out
 
 
+# Istemci tarafi bu degeri kocaman tutabiliyor (opencode.json'da 131072,
+# 128000 gorduk). Saglayici bu istegi ya reddediyor ya da butceyi tek
+# dusunmeye yiyip BOS/kesik cevap donuyor. Guvenli tavan: 32000.
+# Reasoning bu butcenin icinden duser (reasoning_max_tokens=1024).
+_MAX_OUTPUT_TOKENS = 32000
+
+
+def _clamp_max_tokens(value) -> int:
+    """Istemcinin istedigi max_tokens'i saglayici tavanina indirir.
+
+    0/None/negatif -> 1024 (Anthropic varsayilani).
+    Devasa degerler (131072 vb.) -> 32000; aksi halde saglayici 400
+    donuyor ya da butceyi reasoning'e harcip bos cevap veriyor.
+    """
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return 1024
+    return min(n, _MAX_OUTPUT_TOKENS)
+
+
 def _anthropic_to_openai(body: dict) -> dict:
     """Anthropic istek formatini OpenAI formatina cevirir.
 
@@ -1677,7 +1707,8 @@ def _anthropic_to_openai(body: dict) -> dict:
         elif images:
             msgs.append({"role": role, "content": images})
 
-    out: dict = {"messages": msgs, "max_tokens": body.get("max_tokens") or 1024}
+    out: dict = {"messages": msgs,
+                 "max_tokens": _clamp_max_tokens(body.get("max_tokens"))}
     if body.get("temperature") is not None:
         out["temperature"] = body["temperature"]
     # tool tanimlarini cevir (Claude Code agentic calissin diye)
@@ -2349,7 +2380,7 @@ async def chat_completions(request: Request, req: ChatRequest):
     if req.temperature is not None:
         payload["temperature"] = req.temperature
     if req.max_tokens is not None:
-        payload["max_tokens"] = req.max_tokens
+        payload["max_tokens"] = _clamp_max_tokens(req.max_tokens)
     if req.tools:
         payload["tools"] = req.tools
     if req.tool_choice is not None:

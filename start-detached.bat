@@ -35,9 +35,11 @@ REM pythonw.exe = KONSOLSZ. Gorunur terminal acilmaz, o pencere de kapanir.
 REM >>>/>>2&1 KRITIK: bu yonlendirme olmadan arka plandaki surec ebeveynin
 REM stdout pipe'ini acik tutuyor ve cagiran shell (orn. agent terminali)
 REM hic kapanmiyor. Yonlendirme ile cikis akisi serbest birakiliyor.
-REM NOT: "start /b cmd /c" sarmalayicisi KULLANILMAZ; her calistirmada
-REM artik bir cmd.exe birikiyordu. Dogrudan pythonw.calistiriliyor.
-start "" /b "%PY%" "%~dp0supervisor.py" >>"%~dp0logs\supervisor.out" 2>&1
+REM NOT: dogrudan "start pythonw" KULLANILMAZ. Cagiran kabuk kapaninca
+REM Windows surec agacini da olduruyor -> gateway rastgele dustu.
+REM launcher.py DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB ile
+REM supervisor'i kabuktan tamamen ayiriyor.
+py -3 "%~dp0launcher.py"
 
 REM supervisor + uvicorn ayaga kalkana kadar bekle (en fazla 15 sn)
 REM NOT: 'timeout' konsolsuz shell'de "Input redirection is not supported"
