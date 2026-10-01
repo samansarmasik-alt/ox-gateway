@@ -289,6 +289,125 @@ class TestReasoningEffort(unittest.TestCase):
         self.assertEqual(gateway._clamp_thinking_budget(100, 32000), 1024)
         self.assertEqual(gateway._clamp_thinking_budget(8000, 32000), 8000)
 
+
+class TestClientEffortWins(unittest.TestCase):
+    """Istemcinin gonderdigi effort artik OKUNUYOR.
+
+    ONCE HIC OKUNMUYORDU: OpenAI tarzi reasoning / reasoning_effort alanlari
+    gateway tarafindan sessizce dusuruluyordu. Yani opencode bir effort
+    secip gonderiyor, gateway kendi varsayilanini kullaniyordu - kullanici
+    "model secerken effortunu secemiyorum" diyordu.
+    """
+
+    M = "stealth/space-bunny-alpha"
+
+    def test_openai_reasoning_effort_object(self):
+        self.assertEqual(
+            gateway._reasoning_config({"reasoning": {"effort": "low"}}, 32000, self.M),
+            {"effort": "low"})
+
+    def test_openai_reasoning_effort_flat_field(self):
+        self.assertEqual(
+            gateway._reasoning_config({"reasoning_effort": "minimal"}, 32000, self.M),
+            {"effort": "minimal"})
+
+    def test_openai_reasoning_max_tokens(self):
+        self.assertEqual(
+            gateway._reasoning_config({"reasoning": {"max_tokens": 6000}}, 32000, self.M),
+            {"max_tokens": 6000})
+
+    def test_client_effort_is_clamped(self):
+        rc = gateway._reasoning_config({"reasoning": {"max_tokens": 90000}}, 32000, self.M)
+        self.assertEqual(rc, {"max_tokens": 19200})
+
+    def test_client_off_variants_disable(self):
+        for v in ("off", "none", "disabled", "minimalx"):
+            with self.subTest(value=v):
+                self.assertIsNone(
+                    gateway._reasoning_config({"reasoning": {"effort": v}}, 32000, self.M))
+
+    def test_client_reasoning_overrides_model_and_global(self):
+        eski = gateway.CONFIG.get("reasoning_effort")
+        per = gateway.CONFIG.get("reasoning_effort_by_model")
+        try:
+            gateway.CONFIG["reasoning_effort"] = "off"
+            gateway.CONFIG["reasoning_effort_by_model"] = {self.M: "off"}
+            # model ve genel 'off' olsa bile istemci acikca 'high' istedi
+            self.assertEqual(
+                gateway._reasoning_config({"reasoning": {"effort": "high"}}, 32000, self.M),
+                {"effort": "high"})
+        finally:
+            if eski is None:
+                gateway.CONFIG.pop("reasoning_effort", None)
+            else:
+                gateway.CONFIG["reasoning_effort"] = eski
+            if per is None:
+                gateway.CONFIG.pop("reasoning_effort_by_model", None)
+            else:
+                gateway.CONFIG["reasoning_effort_by_model"] = per
+
+
+class TestPerModelEffort(unittest.TestCase):
+    """Model basina thinking ayari: opencode'da model secerken effort secmek."""
+
+    M = "stealth/space-bunny-alpha"
+    F = "liquid/lfm-2.5-2.6b:free"
+
+    def setUp(self):
+        self._effort = gateway.CONFIG.get("reasoning_effort")
+        self._per = gateway.CONFIG.get("reasoning_effort_by_model")
+
+    def tearDown(self):
+        for k, v in (("reasoning_effort", self._effort),
+                     ("reasoning_effort_by_model", self._per)):
+            if v is None:
+                gateway.CONFIG.pop(k, None)
+            else:
+                gateway.CONFIG[k] = v
+
+    def test_model_specific_setting_beats_global(self):
+        gateway.CONFIG["reasoning_effort"] = "low"
+        gateway.CONFIG["reasoning_effort_by_model"] = {self.M: "high", self.F: "off"}
+        self.assertEqual(gateway._reasoning_config({}, 32000, self.M), {"effort": "high"})
+        self.assertIsNone(gateway._reasoning_config({}, 32000, self.F))
+
+    def test_model_without_entry_uses_global(self):
+        gateway.CONFIG["reasoning_effort"] = "medium"
+        gateway.CONFIG["reasoning_effort_by_model"] = {self.F: "off"}
+        self.assertEqual(gateway._reasoning_config({}, 32000, self.M), {"effort": "medium"})
+
+    def test_per_model_off_is_respected(self):
+        gateway.CONFIG["reasoning_effort"] = "high"
+        gateway.CONFIG["reasoning_effort_by_model"] = {self.F: "off"}
+        self.assertIsNone(gateway._reasoning_config({}, 32000, self.F))
+
+    def test_per_model_numeric_uses_max_tokens(self):
+        gateway.CONFIG.pop("reasoning_effort", None)
+        gateway.CONFIG["reasoning_effort_by_model"] = {self.M: "8192"}
+        self.assertEqual(gateway._reasoning_config({}, 32000, self.M),
+                         {"max_tokens": 8192})
+
+    def test_normalize_effort_aliases(self):
+        self.assertEqual(gateway._normalize_effort("off"), "off")
+        self.assertEqual(gateway._normalize_effort(""), "off")
+        self.assertEqual(gateway._normalize_effort("max"), "high")
+        self.assertEqual(gateway._normalize_effort("min"), "minimal")
+        self.assertEqual(gateway._normalize_effort("med"), "medium")
+        self.assertEqual(gateway._normalize_effort("tokens:8192"), "8192")
+        self.assertEqual(gateway._normalize_effort("HIGH"), "high")
+
+    def test_normalize_effort_rejects_garbage(self):
+        import unittest as _u
+        for bad in ("turberk", "tokens:abc", "tokens:0", "-5"):
+            with self.subTest(value=bad):
+                with self.assertRaises(Exception):
+                    gateway._normalize_effort(bad)
+
+    def test_model_list_is_capped(self):
+        lst = gateway._model_list()
+        self.assertLessEqual(len(lst), 40)
+        self.assertIn(gateway.get_active_model(), lst)
+
     def test_payload_variants_strip_reasoning_then_tools(self):
         v = gateway._payload_variants({"messages": [], "reasoning": {"max_tokens": 8},
                                        "tools": [1]})

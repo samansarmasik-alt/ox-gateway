@@ -91,6 +91,7 @@ Tüm anahtarlar `gateway.py` içinde `CONFIG.get(...)` ile okunur. Güvenli vars
 | `token_budget_step` | `2048` | Retry'de bütçe artış adımı (en az 512). |
 | `token_budget_tries` | `3` | Kırpılma/kötü tur için ek deneme sayısı. |
 | `reasoning_effort` | `high` | Thinking seviyesi: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh`, ya da sayı (örn. `4096`). Ad seçilirse `reasoning.effort`, sayı seçilirse `reasoning.max_tokens` gönderilir — **ikisi birden gönderilemez** (OpenRouter `HTTP 400`). Dashboard'daki Thinking seçici veya `POST /reasoning/set {"effort":"high"}` ile değişir; `GET /reasoning` okur. |
+| `reasoning_effort_by_model` | `{}` | Model başına thinking ayarı: `{"vendor/model": "high"}`. Boşsa `reasoning_effort` kullanılır. Çözümleme sırası: **istemci > modele özel > genel**. `POST /reasoning/set {"effort":"low","model":"..."}` ile yazılır, `POST /reasoning/reset` ile silinir. |
 | `reasoning_max_tokens` | `1024` | Geriye uyum: `reasoning_effort` boşsa bu kullanılır. İstemci `thinking.budget_tokens` gönderdiyse **o** değer çevrilir (cevap bütçesinin %60'ıyla sınırlanır). |
 | `max_reasoning_budget` | `2048` | Kötü tur retry'sinde reasoning bütçesinin tavanı. |
 | `degenerate_retry` | `false` | **Varsayılan kapalı, kapalı kalmalı.** Açmak runaway reasoning'e yol açar (aşağıya bak). |

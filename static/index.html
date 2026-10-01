@@ -100,6 +100,11 @@
         <button class="btn-run" style="background:#33406e" onclick="loadReasoning()">Yenile</button>
       </div>
       <p class="hint" id="think-hint"></p>
+      <label class="f">Model başına Thinking &nbsp;(her modelin kendi effort'u olabilir)</label>
+      <div id="effort-rows" style="max-height:240px;overflow:auto"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn-run" style="background:#33406e;flex:1" onclick="resetReasoning()">Tüm özel ayarları sil</button>
+      </div>
       <label class="f">Model &nbsp;(varsayılan en üstte, sonra ücretsizler 🆓 — seçtiğin an kaydedilir)</label>
     <select id="model-sel" onchange="setModel(this.value)" style="width:100%;background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;border-radius:9px;padding:10px 14px;font-size:13.5px;outline:none">
       <option>yükleniyor…</option>
@@ -341,16 +346,47 @@ async function loadReasoning() {
   } catch (e) { toast("Hata: " + e.message); }
 }
 
-async function setReasoning(val) {
+async function setReasoning(val, model) {
   try {
     await jfetch(API + "/reasoning/set", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({effort: val}),
+      body: JSON.stringify(model ? {effort: val, model} : {effort: val}),
     });
-    toast("Thinking: " + val + " ✔");
+    toast("Thinking: " + val + (model ? " · " + model.split("/").pop() : " (genel)") + " ✔");
+    loadModels();
     loadReasoning();
   } catch (e) { toast("Hata: " + e.message); }
+}
+
+// Model basina thinking secici: model listesinin yaninda bir sutun.
+async function resetReasoning() {
+  try {
+    await jfetch(API + "/reasoning/reset", {method: "POST"});
+    toast("Özel ayarlar silindi, genel varsayılana dönüldü ✔");
+    loadModels();
+    loadReasoning();
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+async function renderEffortTable(models, glob) {
+  const host = document.getElementById("effort-rows");
+  if (!host) return;
+  const opts = [["off","Kapalı"],["minimal","Minimal"],["low","Düşük"],
+                ["medium","Orta"],["high","Yüksek"],["xhigh","Çok yüksek"]];
+  host.innerHTML = models.map(m => {
+    const cur = m.effort || glob || "off";
+    const o = opts.map(([v, l]) =>
+      `<option value="${v}" ${v === cur ? "selected" : ""}>${l}</option>`).join("");
+    const short = String(m.id).split("/").pop();
+    const ozel = (m.effort && m.effort !== glob) ? " · özel" : "";
+    return `<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #1b2340">
+      <div style="flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+           title="${m.id}">${m.free ? "🆓 " : ""}${short}${ozel}</div>
+      <select onchange="setReasoning(this.value, '${m.id}')"
+        style="background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;padding:5px 8px;border-radius:8px;font-size:12px">${o}</select>
+    </div>`;
+  }).join("");
 }
 
 async function loadModels() {
@@ -360,9 +396,10 @@ async function loadModels() {
     sel.innerHTML = d.models.map(m => {
       const badge = m.default ? "" : (m.free ? "🆓 " : "");
       const label = m.default ? m.name : `${badge}${m.name} · ${m.id}`;
-      return `<option value="${m.id}">${label}</option>`;
+      return `<option value="${m.id}">${label}${m.effort && m.effort !== "off" ? " · " + m.effort : ""}</option>`;
     }).join("");
     sel.value = d.default;
+    renderEffortTable(d.models, d.reasoning_effort);
   } catch {}
 }
 

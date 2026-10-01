@@ -1484,23 +1484,51 @@ async def providers_info():
     return {"active_mode": get_active_mode(), "modes": out}
 
 
-class ReasoningSetRequest(BaseModel):
-    effort: str
-
-
 def _reasoning_current() -> str:
     raw = CONFIG.get("reasoning_effort")
     if raw is None or str(raw).strip() == "":
-        return "off" if not int(CONFIG.get("reasoning_max_tokens", 0) or 0) \
-            else f"tokens:{CONFIG.get('reasoning_max_tokens', 1024)}"
+        try:
+            n = int(CONFIG.get("reasoning_max_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        return str(n) if n > 0 else "off"
     return str(raw).strip().lower()
+
+
+class ReasoningSetRequest(BaseModel):
+    effort: str
+    model: str | None = None
+
+
+def _normalize_effort(val: str) -> str:
+    s = str(val or "").strip().lower()
+    if s in ("", "off"):
+        return "off"
+    if s.startswith("tokens:"):
+        try:
+            n = int(s.split(":", 1)[1])
+        except (IndexError, ValueError):
+            raise HTTPException(400, "tokens:<sayi> bicimi bozuk")
+        if n <= 0:
+            raise HTTPException(400, "token sayisi pozitif olmali")
+        return str(n)
+    if s in ("min", "med", "max", "yok", "kapali", "none", "disabled"):
+        return {"min": "minimal", "med": "medium", "max": "high", "yok": "off",
+                "kapali": "off", "none": "off", "disabled": "off"}[s]
+    if s not in _THINKING_EFFORTS:
+        raise HTTPException(400, "off | minimal | low | medium | high | xhigh "
+                                  "| tokens:<n> olmali")
+    return s
 
 
 @app.get("/reasoning")
 async def reasoning_get():
-    """Su anki thinking ayari (dashboard ve doctor icin)."""
+    """Thinking ayarlari: genel varsayilan + modele ozel olanlar."""
+    per = CONFIG.get("reasoning_effort_by_model") or {}
     return {
         "reasoning_effort": _reasoning_current(),
+        "by_model": per if isinstance(per, dict) else {},
+        "models": _model_list(),
         "supported": ["off", "minimal", "low", "medium", "high", "xhigh",
                       "tokens:<n>"],
         "note": ("OpenRouter'da effort ve max_tokens birlikte gonderilemez "
@@ -1511,34 +1539,40 @@ async def reasoning_get():
 @app.post("/reasoning/set")
 async def reasoning_set(req: ReasoningSetRequest, request: Request):
     check_auth(request)
-    val = str(req.effort or "").strip().lower()
-    if val in ("", "off"):
-        val = "off"
-    elif val.startswith("tokens:"):
-        try:
-            n = int(val.split(":", 1)[1])
-        except (IndexError, ValueError):
-            raise HTTPException(400, "tokens:<sayi> bicimi bozuk")
-        if n <= 0:
-            raise HTTPException(400, "token sayisi pozitif olmali")
-        val = str(n)
-    elif val in ("min", "med", "max", "yok", "kapali", "none", "disabled"):
-        val = {"min": "minimal", "med": "medium", "max": "high",
-               "yok": "off", "kapali": "off", "none": "off",
-               "disabled": "off"}[val]
-    elif val not in _THINKING_EFFORTS:
-        raise HTTPException(400, "off | minimal | low | medium | high | xhigh "
-                                  "| tokens:<n> olmali")
+    val = _normalize_effort(req.effort)
     cfg = load_config()
-    cfg["reasoning_effort"] = val
-    # geriye uyum: sayi secildiyse eski alan da senkron kalsin
-    if val.isdigit():
-        cfg["reasoning_max_tokens"] = int(val)
+    if req.model:
+        per = cfg.get("reasoning_effort_by_model") or {}
+        if not isinstance(per, dict):
+            per = {}
+        per[req.model] = val
+        cfg["reasoning_effort_by_model"] = per
+        CONFIG["reasoning_effort_by_model"] = per
+        scope = req.model
+    else:
+        cfg["reasoning_effort"] = val
+        # geriye uyum: sayi secildiyse eski alan da senkron kalsin
+        if val.isdigit():
+            cfg["reasoning_max_tokens"] = int(val)
+        CONFIG["reasoning_effort"] = val
+        scope = "*"
     save_config(cfg)
-    CONFIG["reasoning_effort"] = val
-    return {"set": True, "reasoning_effort": val,
-            "effective": _reasoning_config({"thinking": None},
-                                           _MAX_OUTPUT_TOKENS)}
+    return {"set": True, "scope": scope, "reasoning_effort": val,
+            "global": _reasoning_current(),
+            "by_model": CONFIG.get("reasoning_effort_by_model") or {},
+            "effective": _reasoning_config({}, _MAX_OUTPUT_TOKENS,
+                                           req.model if req.model else None)}
+
+
+@app.post("/reasoning/reset")
+async def reasoning_reset(request: Request):
+    """Modele ozel tum ayarlari siler, genel varsayilana doner."""
+    check_auth(request)
+    cfg = load_config()
+    cfg.pop("reasoning_effort_by_model", None)
+    save_config(cfg)
+    CONFIG.pop("reasoning_effort_by_model", None)
+    return {"reset": True, "global": _reasoning_current(), "by_model": {}}
 
 
 @app.post("/mode/set")
@@ -1823,38 +1857,55 @@ def _clamp_thinking_budget(requested: int, out_budget: int) -> int:
     return max(1024, min(int(requested), cap))
 
 
-def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS) -> dict | None:
-    """Anthropic 'thinking' alanini OpenRouter reasoning'e cevirir.
+def _reasoning_from_client(body: dict) -> tuple[dict | None, bool]:
+    """Istemcinin isteyerek gonderdigi thinking/reasoning degeri.
 
-    ONCEKI HALI IKI YANLIS YAPIYORDU:
-      1) Istemci thinking.budget_tokens gonderdiginde `return None` yapiliyordu,
-         yani "thinking ACIK" diyen istemciye gateway thinking'i TAMAMEN
-         KAPATIYORDU. Claude Code bu alani sik gonderiyor; model neredeyse
-         hic dusunmedigi icin suphelenilen belirti buydu.
-      2) Sadece sabit 1024 token butce gonderiliyordu.
-    Artik:
-      - Istemci acikca budget_tokens gonderdiyse O deger kullanilir (kirpilarak)
-      - Istemci bir sey gondermediyse config: reasoning_effort (off/low/medium/
-        high/minimal/xhigh) veya sayi (geriye uyum: reasoning_max_tokens)
-      - effort ve max_tokens ASLA birlikte gonderilmez (400 verir)
-    Dusundurmesi desteklemeyen bir modele gondermek zararli degil: OpenRouter
-    alani yok sayiyor (dort modelde de test edildi, hicbiri 400 vermedi).
+    Iki protokol de desteklenir:
+      - Anthropic: thinking: {type: "disabled" | "enabled", budget_tokens: N}
+      - OpenAI   : reasoning: {effort: "high"} | {max_tokens: N}
+                   veya reasoning_effort: "high"
+
+    Donus: (gecerli OpenRouter reasoning dict | None, acikca_kapali_mi)
+    Istemci hicbir sey gondermediyse (None, False).
     """
+    # --- Anthropic tarzi ---
     th = body.get("thinking")
-    client_budget = 0
     if isinstance(th, dict):
         if str(th.get("type") or "").lower() == "disabled":
-            return None
-        try:
-            client_budget = int(th.get("budget_tokens") or 0)
-        except (TypeError, ValueError):
-            client_budget = 0
-    if client_budget > 0:
-        return {"max_tokens": _clamp_thinking_budget(client_budget, out_budget)}
+            return None, True
+        raw = th.get("budget_tokens")
+        if raw:
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                return {"max_tokens": n}, False
 
-    raw = CONFIG.get("reasoning_effort")
-    if raw is None or str(raw).strip() == "":
-        raw = CONFIG.get("reasoning_max_tokens", 1024)  # geriye uyum
+    # --- OpenAI tarzi (opencode, SDK'lar) ---
+    rc = body.get("reasoning")
+    if isinstance(rc, dict):
+        eff = rc.get("effort")
+        if eff:
+            return {"effort": str(eff)}, False
+        mt = rc.get("max_tokens")
+        if mt:
+            try:
+                n = int(mt)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                return {"max_tokens": n}, False
+    eff = body.get("reasoning_effort")
+    if eff:
+        return {"effort": str(eff)}, False
+    return None, False
+
+
+def _effort_to_reasoning(raw, out_budget: int) -> dict | None:
+    """Ayarlama degeri -> OpenRouter reasoning (effort VEYA max_tokens, tekil)."""
+    if raw is None:
+        return None
     s = str(raw).strip().lower()
     if s in _THINKING_OFF:
         return None
@@ -1867,6 +1918,52 @@ def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS) -> dict 
     if n <= 0:
         return None
     return {"max_tokens": _clamp_thinking_budget(n, out_budget)}
+
+
+def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS,
+                      model: str | None = None) -> dict | None:
+    """Thinking/reasoning ayarini cozer. Oncelik sirasi:
+
+      1. Istemci acikca bir sey gonderdiyse (thinking / reasoning / reasoning_effort)
+      2. config.reasoning_effort_by_model[model] -> O MODEL icin ozel effort
+      3. config.reasoning_effort -> genel varsayilan
+      4. config.reasoning_max_tokens (geriye uyum)
+
+    ONCEKI HALI IKI YANLIS YAPIYORDU:
+      1) Istemci thinking.budget_tokens gonderdiginde `return None` yapiliyordu,
+         yani "thinking ACIK" diyen istemciye gateway thinking'i TAMAMEN
+         KAPATIYORDU. Claude Code bu alani sik gonderiyor; model neredeyse
+         hic dusunmedigi icin suphelenilen belirti buydu.
+      2) Istemcinin OpenAI tarzi `reasoning` / `reasoning_effort` alanlari
+         HIC OKUNMUYORDU - yani istemci effort secip gonderiyor, gateway
+         sessizce kendi varsayilanini kullaniyordu.
+    effort ve max_tokens ASLA birlikte gonderilmez (OpenRouter HTTP 400).
+    """
+    rc, kapali = _reasoning_from_client(body)
+    if kapali:
+        return None
+    if rc:
+        if "effort" in rc:
+            eff = rc["effort"].strip().lower()
+            if eff in _THINKING_OFF:
+                return None
+            if eff not in _THINKING_EFFORTS:
+                return None
+            return {"effort": eff}
+        return {"max_tokens": _clamp_thinking_budget(rc["max_tokens"], out_budget)}
+
+    # 2) modele ozel ayar
+    per = CONFIG.get("reasoning_effort_by_model") or {}
+    if model and isinstance(per, dict) and model in per:
+        got = _effort_to_reasoning(per[model], out_budget)
+        if got is not None or str(per[model]).strip().lower() in _THINKING_OFF:
+            return got
+
+    # 3) genel varsayilan
+    raw = CONFIG.get("reasoning_effort")
+    if raw is None or str(raw).strip() == "":
+        raw = CONFIG.get("reasoning_max_tokens", 1024)  # geriye uyum
+    return _effort_to_reasoning(raw, out_budget)
 
 
 _ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
@@ -2107,7 +2204,8 @@ async def anthropic_messages(request: Request):
         return result
 
     payload = _anthropic_to_openai(body)
-    rc = _reasoning_config(body, payload.get("max_tokens", _MAX_OUTPUT_TOKENS))
+    rc = _reasoning_config(body, payload.get("max_tokens", _MAX_OUTPUT_TOKENS),
+                           model)
     if rc:
         payload["reasoning"] = rc
     stall_s = max(5.0, float(CONFIG.get("stall_timeout", 45)))
@@ -2564,7 +2662,41 @@ async def models_payload() -> dict:
     free_first = [m for m in items if m["free"]] + [m for m in items if not m["free"]]
     ordered = [{"id": default, "name": f"⭐ {default} (varsayılan)", "free": False, "default": True}] + \
               [m for m in free_first if m["id"] != default]
-    return {"default": default, "total": len(ordered), "models": ordered}
+    # Modele ozel thinking ayarini her modelle birlikte dondur: dashboard
+    # model listesinden yaninda effort secici gosterebilsin.
+    per = CONFIG.get("reasoning_effort_by_model") or {}
+    per = per if isinstance(per, dict) else {}
+    glob = _reasoning_current()
+    for it in ordered:
+        it["effort"] = per.get(it["id"], glob)
+    return {"default": default, "total": len(ordered), "models": ordered,
+            "reasoning_effort": glob, "by_model": per}
+
+
+def _model_list() -> list[str]:
+    """Effort paneli icin anlamli model listesi: aktif model + ucretsizler.
+
+    Tum OpenRouter katalogu (400+ model) dondurulmez; dashboard zaten
+    /api/models ile sirali listeyi aliyor. Yanit boyutunu kisitliyoruz.
+    """
+    out = [get_active_model()]
+    for m in (MODELS_CACHE.get("data") or []):
+        if isinstance(m, dict) and m.get("id") and _is_free(m):
+            out.append(m["id"])
+    seen: list[str] = []
+    for x in out:
+        if x not in seen:
+            seen.append(x)
+    return seen[:40]
+    out = [get_active_model()]
+    for m in (MODELS_CACHE.get("data") or []):
+        if isinstance(m, dict) and m.get("id"):
+            out.append(m["id"])
+    seen: list[str] = []
+    for x in out:
+        if x not in seen:
+            seen.append(x)
+    return seen
 
 
 @app.get("/api/models")
