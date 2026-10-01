@@ -86,8 +86,21 @@
       <button id="mode-1" class="btn-run" style="flex:1" onclick="setMode('1')">1️⃣ Mod 1 · Atria</button>
       <button id="mode-2" class="btn-del" style="flex:1;background:#1c2542;color:#93a4d1;border-color:#2a3354" onclick="setMode('2')">2️⃣ Mod 2 · OpenRouter</button>
     </div>
-    <p class="hint" id="provider-hint"></p>
-    <label class="f">Model &nbsp;(varsayılan en üstte, sonra ücretsizler 🆓 — seçtiğin an kaydedilir)</label>
+      <p class="hint" id="provider-hint"></p>
+      <label class="f">Thinking &nbsp;(düşünme bütçesi — destekleyen modellerde daha çok düşünür, kapalı = hiç düşünmez)</label>
+      <div class="row">
+        <select id="think-sel" onchange="setReasoning(this.value)" style="flex:1;background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;padding:10px;border-radius:10px">
+          <option value="off">Kapalı</option>
+          <option value="minimal">Minimal</option>
+          <option value="low">Düşük</option>
+          <option value="medium">Orta</option>
+          <option value="high">Yüksek</option>
+          <option value="xhigh">Çok yüksek</option>
+        </select>
+        <button class="btn-run" style="background:#33406e" onclick="loadReasoning()">Yenile</button>
+      </div>
+      <p class="hint" id="think-hint"></p>
+      <label class="f">Model &nbsp;(varsayılan en üstte, sonra ücretsizler 🆓 — seçtiğin an kaydedilir)</label>
     <select id="model-sel" onchange="setModel(this.value)" style="width:100%;background:#0b1020;border:1px solid #2a3354;color:#e2e8f0;border-radius:9px;padding:10px 14px;font-size:13.5px;outline:none">
       <option>yükleniyor…</option>
     </select>
@@ -314,6 +327,32 @@ function copyText(text) {
   navigator.clipboard.writeText(text).then(() => toast("Panoya kopyalandı ✔"));
 }
 
+async function loadReasoning() {
+  try {
+    const d = await jfetch(API + "/reasoning");
+    const sel = document.getElementById("think-sel");
+    const v = d.reasoning_effort || "off";
+    if (![...sel.options].some(o => o.value === v)) {
+      sel.insertAdjacentHTML("beforeend", `<option value="${v}">Özel (${v})</option>`);
+    }
+    sel.value = v;
+    document.getElementById("think-hint").textContent =
+      "Aktif: " + v + " — " + (d.note || "");
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
+async function setReasoning(val) {
+  try {
+    await jfetch(API + "/reasoning/set", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({effort: val}),
+    });
+    toast("Thinking: " + val + " ✔");
+    loadReasoning();
+  } catch (e) { toast("Hata: " + e.message); }
+}
+
 async function loadModels() {
   try {
     const d = await jfetch(API + "/api/models");
@@ -516,6 +555,7 @@ async function runAgents() {
 
 loadConn();
 loadModels();
+loadReasoning();
 refresh();
 setInterval(refresh, 2000);
 </script>

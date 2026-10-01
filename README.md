@@ -90,7 +90,8 @@ Tüm anahtarlar `gateway.py` içinde `CONFIG.get(...)` ile okunur. Güvenli vars
 | `max_token_budget` | `32768` | Kırpılma (truncation) retry'sinde tavan. |
 | `token_budget_step` | `2048` | Retry'de bütçe artış adımı (en az 512). |
 | `token_budget_tries` | `3` | Kırpılma/kötü tur için ek deneme sayısı. |
-| `reasoning_max_tokens` | `1024` | Gateway'in kendi reasoning bütçesi. `0` reasoning'i kapatır. İstemci kendi `thinking.budget_tokens` gönderdiyse o kazanır. |
+| `reasoning_effort` | `high` | Thinking seviyesi: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh`, ya da sayı (örn. `4096`). Ad seçilirse `reasoning.effort`, sayı seçilirse `reasoning.max_tokens` gönderilir — **ikisi birden gönderilemez** (OpenRouter `HTTP 400`). Dashboard'daki Thinking seçici veya `POST /reasoning/set {"effort":"high"}` ile değişir; `GET /reasoning` okur. |
+| `reasoning_max_tokens` | `1024` | Geriye uyum: `reasoning_effort` boşsa bu kullanılır. İstemci `thinking.budget_tokens` gönderdiyse **o** değer çevrilir (cevap bütçesinin %60'ıyla sınırlanır). |
 | `max_reasoning_budget` | `2048` | Kötü tur retry'sinde reasoning bütçesinin tavanı. |
 | `degenerate_retry` | `false` | **Varsayılan kapalı, kapalı kalmalı.** Açmak runaway reasoning'e yol açar (aşağıya bak). |
 | `degenerate_token_floor` | `64` | Yalnızca `degenerate_retry` açıkken: bu altındaki `completion_tokens` "kötü tur" sayılır. |

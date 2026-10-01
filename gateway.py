@@ -1484,6 +1484,63 @@ async def providers_info():
     return {"active_mode": get_active_mode(), "modes": out}
 
 
+class ReasoningSetRequest(BaseModel):
+    effort: str
+
+
+def _reasoning_current() -> str:
+    raw = CONFIG.get("reasoning_effort")
+    if raw is None or str(raw).strip() == "":
+        return "off" if not int(CONFIG.get("reasoning_max_tokens", 0) or 0) \
+            else f"tokens:{CONFIG.get('reasoning_max_tokens', 1024)}"
+    return str(raw).strip().lower()
+
+
+@app.get("/reasoning")
+async def reasoning_get():
+    """Su anki thinking ayari (dashboard ve doctor icin)."""
+    return {
+        "reasoning_effort": _reasoning_current(),
+        "supported": ["off", "minimal", "low", "medium", "high", "xhigh",
+                      "tokens:<n>"],
+        "note": ("OpenRouter'da effort ve max_tokens birlikte gonderilemez "
+                 "(HTTP 400). effort daha guclu olculdu."),
+    }
+
+
+@app.post("/reasoning/set")
+async def reasoning_set(req: ReasoningSetRequest, request: Request):
+    check_auth(request)
+    val = str(req.effort or "").strip().lower()
+    if val in ("", "off"):
+        val = "off"
+    elif val.startswith("tokens:"):
+        try:
+            n = int(val.split(":", 1)[1])
+        except (IndexError, ValueError):
+            raise HTTPException(400, "tokens:<sayi> bicimi bozuk")
+        if n <= 0:
+            raise HTTPException(400, "token sayisi pozitif olmali")
+        val = str(n)
+    elif val in ("min", "med", "max", "yok", "kapali", "none", "disabled"):
+        val = {"min": "minimal", "med": "medium", "max": "high",
+               "yok": "off", "kapali": "off", "none": "off",
+               "disabled": "off"}[val]
+    elif val not in _THINKING_EFFORTS:
+        raise HTTPException(400, "off | minimal | low | medium | high | xhigh "
+                                  "| tokens:<n> olmali")
+    cfg = load_config()
+    cfg["reasoning_effort"] = val
+    # geriye uyum: sayi secildiyse eski alan da senkron kalsin
+    if val.isdigit():
+        cfg["reasoning_max_tokens"] = int(val)
+    save_config(cfg)
+    CONFIG["reasoning_effort"] = val
+    return {"set": True, "reasoning_effort": val,
+            "effective": _reasoning_config({"thinking": None},
+                                           _MAX_OUTPUT_TOKENS)}
+
+
 @app.post("/mode/set")
 @app.post("/provider/set")
 async def set_mode(req: ModeSetRequest, request: Request):
@@ -1743,28 +1800,73 @@ def _anthropic_to_openai(body: dict) -> dict:
     return out
 
 
-def _reasoning_config(body: dict) -> dict | None:
+# OpenRouter'da reasoning iki bicimde verilebilir ve IKISI BIRLIKTE
+# gonderilemez (olculdu):
+#   HTTP 400 "Only one of reasoning.effort and reasoning.max_tokens can be
+#   specified"
+# Olcum (space-bunny-alpha, 2 istek): effort=high 568 dusunme karakteri,
+# reasoning.max_tokens=8192 367, max_tokens=16384 138. Yani 'effort' daha
+# guclu ve daha guvenilir; kullanici 'off | low | medium | high' secerse
+# effort, sayi secerse max_tokens gonderiyoruz.
+_THINKING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+_THINKING_OFF = ("off", "none", "0", "false", "disabled", "kapali", "yok")
+
+
+def _clamp_thinking_budget(requested: int, out_budget: int) -> int:
+    """Dusunme butcesini cevap icin yer birakacak sekilde kisaltir.
+
+    Istemci 32000 dusunme isteyebilir; o zaman cevap icin token kalmaz ve
+    model butceyi tek basina yiyip bos metin doner. Butce cevap butcesinin
+    en fazla %60'i kadar olur.
+    """
+    cap = max(1024, int(out_budget * 0.6))
+    return max(1024, min(int(requested), cap))
+
+
+def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS) -> dict | None:
     """Anthropic 'thinking' alanini OpenRouter reasoning'e cevirir.
 
-    Dusunme butcesi 'reasoning_max_tokens' ile ayarlanir (varsayilan 1024).
-    Eskiden 64'e zorlaniyordu; olcum gosterdi ki model arac cagrisi uretmek
-    yerine anlatim metnine yaziliyordu (tool_uses=0, 16k karakter salt metin).
-    Butceyi kisitlamak planlama yapmasini engelliyordu. 0 verilirse
-    reasoning tamamen kapatilir.
-    Istemci kendi thinking budget'u gonderdiyse ona dokunulmaz."""
-    client_budget = 0
+    ONCEKI HALI IKI YANLIS YAPIYORDU:
+      1) Istemci thinking.budget_tokens gonderdiginde `return None` yapiliyordu,
+         yani "thinking ACIK" diyen istemciye gateway thinking'i TAMAMEN
+         KAPATIYORDU. Claude Code bu alani sik gonderiyor; model neredeyse
+         hic dusunmedigi icin suphelenilen belirti buydu.
+      2) Sadece sabit 1024 token butce gonderiliyordu.
+    Artik:
+      - Istemci acikca budget_tokens gonderdiyse O deger kullanilir (kirpilarak)
+      - Istemci bir sey gondermediyse config: reasoning_effort (off/low/medium/
+        high/minimal/xhigh) veya sayi (geriye uyum: reasoning_max_tokens)
+      - effort ve max_tokens ASLA birlikte gonderilmez (400 verir)
+    Dusundurmesi desteklemeyen bir modele gondermek zararli degil: OpenRouter
+    alani yok sayiyor (dort modelde de test edildi, hicbiri 400 vermedi).
+    """
     th = body.get("thinking")
+    client_budget = 0
     if isinstance(th, dict):
+        if str(th.get("type") or "").lower() == "disabled":
+            return None
         try:
             client_budget = int(th.get("budget_tokens") or 0)
         except (TypeError, ValueError):
             client_budget = 0
     if client_budget > 0:
-        return None  # istemci kendi butcesini yonetiyor
-    budget = int(CONFIG.get("reasoning_max_tokens", 1024))
-    if budget <= 0:
+        return {"max_tokens": _clamp_thinking_budget(client_budget, out_budget)}
+
+    raw = CONFIG.get("reasoning_effort")
+    if raw is None or str(raw).strip() == "":
+        raw = CONFIG.get("reasoning_max_tokens", 1024)  # geriye uyum
+    s = str(raw).strip().lower()
+    if s in _THINKING_OFF:
         return None
-    return {"max_tokens": budget}
+    if s in _THINKING_EFFORTS:
+        return {"effort": s}
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return {"max_tokens": _clamp_thinking_budget(n, out_budget)}
 
 
 _ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
@@ -1820,6 +1922,10 @@ def _openai_finish_is_error(finish: str | None) -> bool:
 def _openai_to_anthropic_blocks(message: dict) -> list[dict]:
     """OpenAI cevap mesajini Anthropic content bloklarina cevirir."""
     blocks: list[dict] = []
+    # Dusundugu sey once gelir (Anthropic sirasi: thinking -> text -> tool_use)
+    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+    if isinstance(reasoning, str) and reasoning.strip():
+        blocks.append({"type": "thinking", "thinking": reasoning})
     if message.get("content"):
         blocks.append({"type": "text", "text": message["content"]})
     for tc in message.get("tool_calls") or []:
@@ -2001,7 +2107,7 @@ async def anthropic_messages(request: Request):
         return result
 
     payload = _anthropic_to_openai(body)
-    rc = _reasoning_config(body)
+    rc = _reasoning_config(body, payload.get("max_tokens", _MAX_OUTPUT_TOKENS))
     if rc:
         payload["reasoning"] = rc
     stall_s = max(5.0, float(CONFIG.get("stall_timeout", 45)))

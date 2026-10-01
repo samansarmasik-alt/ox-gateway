@@ -166,8 +166,12 @@ class TestTokenBudgetPlumbing(unittest.TestCase):
         self.assertEqual(out["max_tokens"], 1024)
 
     def test_reasoning_budget_comes_from_config(self):
+        # NOT: reasoning_effort varsa o onceliklidir; sayi secimi ancak
+        # reasoning_effort bos/None iken devreye girer.
+        eski_effort = gateway.CONFIG.get("reasoning_effort")
         eski = gateway.CONFIG.get("reasoning_max_tokens")
         try:
+            gateway.CONFIG.pop("reasoning_effort", None)
             gateway.CONFIG["reasoning_max_tokens"] = 1024
             self.assertEqual(gateway._reasoning_config({}), {"max_tokens": 1024})
         finally:
@@ -175,14 +179,39 @@ class TestTokenBudgetPlumbing(unittest.TestCase):
                 gateway.CONFIG.pop("reasoning_max_tokens", None)
             else:
                 gateway.CONFIG["reasoning_max_tokens"] = eski
+            if eski_effort is None:
+                gateway.CONFIG.pop("reasoning_effort", None)
+            else:
+                gateway.CONFIG["reasoning_effort"] = eski_effort
 
     def test_client_thinking_budget_wins(self):
-        self.assertIsNone(gateway._reasoning_config(
-            {"thinking": {"type": "enabled", "budget_tokens": 4096}}))
+        """Istemci thinking budget_tokens gonderdiyse O DEGER kullanilir.
+
+        ONCEKI DAVRANIS (DUZELTILDI): burada None donuyordu, yani "thinking
+        ACIK" diyen istemciye gateway thinking'i tamamen KAPATIYORDU.
+        Claude Code bu alani sik gonderiyor; model neredeyse hic dusunmedigi
+        icin suphelenilen belirti buydu.
+        """
+        self.assertEqual(
+            gateway._reasoning_config(
+                {"thinking": {"type": "enabled", "budget_tokens": 4096}}),
+            {"max_tokens": 4096})
+
+    def test_client_thinking_budget_is_clamped_to_leave_answer_room(self):
+        """Istemci 60000 dusunme isteyebilir; cevap icin yer kalmali."""
+        rc = gateway._reasoning_config(
+            {"thinking": {"type": "enabled", "budget_tokens": 60000}}, 32000)
+        self.assertEqual(rc, {"max_tokens": 19200})  # 32000 * 0.6
+
+    def test_thinking_disabled_type_turns_reasoning_off(self):
+        self.assertIsNone(
+            gateway._reasoning_config({"thinking": {"type": "disabled"}}))
 
     def test_thinking_zero_disables_gateway_reasoning(self):
+        eski_effort = gateway.CONFIG.get("reasoning_effort")
         eski = gateway.CONFIG.get("reasoning_max_tokens")
         try:
+            gateway.CONFIG.pop("reasoning_effort", None)
             gateway.CONFIG["reasoning_max_tokens"] = 0
             self.assertIsNone(gateway._reasoning_config({}))
         finally:
@@ -190,6 +219,75 @@ class TestTokenBudgetPlumbing(unittest.TestCase):
                 gateway.CONFIG.pop("reasoning_max_tokens", None)
             else:
                 gateway.CONFIG["reasoning_max_tokens"] = eski
+            if eski_effort is None:
+                gateway.CONFIG.pop("reasoning_effort", None)
+            else:
+                gateway.CONFIG["reasoning_effort"] = eski_effort
+
+
+class TestReasoningEffort(unittest.TestCase):
+    """reasoning_effort ayari: effort <-> max_tokens secimi ve gecersiz degerler.
+
+    OpenRouter olcum notu: effort ve max_tokens AYNI ANDA gonderilemez,
+    HTTP 400 donuyor ("Only one of reasoning.effort and reasoning.max_tokens
+    can be specified"). Bu yuzden ikisi birden ASLA uretilmemeli.
+    """
+
+    def setUp(self):
+        self._effort = gateway.CONFIG.get("reasoning_effort")
+        self._tokens = gateway.CONFIG.get("reasoning_max_tokens")
+
+    def tearDown(self):
+        for k, v in (("reasoning_effort", self._effort),
+                     ("reasoning_max_tokens", self._tokens)):
+            if v is None:
+                gateway.CONFIG.pop(k, None)
+            else:
+                gateway.CONFIG[k] = v
+
+    def _with(self, **cfg):
+        for k in ("reasoning_effort", "reasoning_max_tokens"):
+            gateway.CONFIG.pop(k, None)
+        gateway.CONFIG.update(cfg)
+
+    def test_named_levels_map_to_effort(self):
+        for lvl in ("minimal", "low", "medium", "high", "xhigh"):
+            with self.subTest(level=lvl):
+                self._with(reasoning_effort=lvl)
+                self.assertEqual(gateway._reasoning_config({}), {"effort": lvl})
+
+    def test_numeric_maps_to_max_tokens(self):
+        self._with(reasoning_effort="4096")
+        self.assertEqual(gateway._reasoning_config({}, 32000),
+                         {"max_tokens": 4096})
+
+    def test_off_variants_disable(self):
+        for v in ("off", "OFF", "none", "0", "false", "kapali", "yok"):
+            with self.subTest(value=v):
+                self._with(reasoning_effort=v)
+                self.assertIsNone(gateway._reasoning_config({}))
+
+    def test_empty_effort_means_unset_and_uses_legacy_tokens(self):
+        # "" bos deger "ayar yok" demektir (geriye uyum), "off" degil.
+        self._with(reasoning_effort="", reasoning_max_tokens=1024)
+        self.assertEqual(gateway._reasoning_config({}), {"max_tokens": 1024})
+
+    def test_never_sends_effort_and_max_tokens_together(self):
+        for v in ("low", "medium", "high", "xhigh", "minimal", "2048"):
+            with self.subTest(value=v):
+                self._with(reasoning_effort=v)
+                rc = gateway._reasoning_config({}, 32000) or {}
+                self.assertFalse("effort" in rc and "max_tokens" in rc,
+                                 "OpenRouter 400 verir")
+
+    def test_missing_effort_falls_back_to_legacy_tokens(self):
+        self._with(reasoning_max_tokens=1024)
+        self.assertEqual(gateway._reasoning_config({}), {"max_tokens": 1024})
+
+    def test_clamp_leaves_answer_room(self):
+        self.assertEqual(gateway._clamp_thinking_budget(60000, 32000), 19200)
+        self.assertEqual(gateway._clamp_thinking_budget(100, 32000), 1024)
+        self.assertEqual(gateway._clamp_thinking_budget(8000, 32000), 8000)
 
     def test_payload_variants_strip_reasoning_then_tools(self):
         v = gateway._payload_variants({"messages": [], "reasoning": {"max_tokens": 8},
