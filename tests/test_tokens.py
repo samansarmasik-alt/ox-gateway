@@ -347,6 +347,48 @@ class TestClientEffortWins(unittest.TestCase):
                 gateway.CONFIG["reasoning_effort_by_model"] = per
 
 
+class TestOpencodeModelSchema(unittest.TestCase):
+    """sync_opencode'in yazdigi model nesnesi opencode semasina uymali.
+
+    Semayi opencode.exe binary'sinden cikardik (ConfigProviderV1.Model):
+      id, name, family, release_date, attachment, reasoning, temperature,
+      tool_call, interleaved, cost, limit, modalities, experimental, status,
+      provider, options, headers, variants
+    """
+
+    def setUp(self):
+        import sync_opencode
+        self.caps = sync_opencode.model_capabilities()
+
+    def test_model_marked_as_reasoning(self):
+        """opencode'da reasoning varsayilan FALSE; isaretlenmezse model
+        'dusunen model' sayilmaz ve thinking arayuzu acilmaz."""
+        self.assertTrue(self.caps["reasoning"])
+
+    def test_limit_declared(self):
+        """limit.output semada zorunlu; opencode variantlari bu degerden
+        hesapliyor (thinking butcesi)."""
+        self.assertIn("limit", self.caps)
+        self.assertIn("output", self.caps["limit"])
+        self.assertIn("context", self.caps["limit"])
+
+    def test_output_limit_matches_gateway_ceiling(self):
+        import gateway
+        self.assertEqual(self.caps["limit"]["output"], gateway._MAX_OUTPUT_TOKENS)
+
+    def test_vision_modalities_declared(self):
+        self.assertIn("image", self.caps["modalities"]["input"])
+
+    def test_max_variant_fits_inside_clamp(self):
+        """En buyuk butce cevap icin yer birakmali (gateway %60 kirpar)."""
+        import sync_opencode
+        import gateway
+        biggest = sync_opencode.thinking_variants()["max"]["thinking"]["budgetTokens"]
+        self.assertEqual(
+            gateway._clamp_thinking_budget(biggest, gateway._MAX_OUTPUT_TOKENS), 19200)
+        self.assertLess(biggest, gateway._MAX_OUTPUT_TOKENS)
+
+
 class TestThinkingVariantsShape(unittest.TestCase):
     """sync_opencode'in opencode.json'a yazdigi thinking varyantlari.
 

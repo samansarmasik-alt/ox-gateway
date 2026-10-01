@@ -64,26 +64,56 @@ def _fallbacks() -> list[tuple[str, str]]:
 
 
 def thinking_variants() -> dict:
-    """Model basina thinking secenekleri (opencode model secici bunlari gosterir).
+    """Model basina thinking secenekleri.
 
-    OpenCode'un kendi kodundan cikarildi (binary icinde dogrulandi):
+    ACIKLAMA - opencode'da bu secenekler model listesinde ayri bir kontrol
+    olarak GORUNMEZ. opencode'un kendi tus haritasinda:
+
+        variant_cycle : ctrl+t  ->  "Cycle model variants"
+
+    Yani modeller bu alanlarla "dusunen model" olarak isaretlenir, secim
+    yapmak icin Ctrl+T kullanilir.
+
+    OpenCode'un kodu (binary'den dogrulandi):
 
         case "@ai-sdk/anthropic":
+        case "@ai-sdk/google-vertex/anthropic":
           return { thinking: { type: "enabled", budgetTokens: Z } }
 
-    Yani provider npm'i @ai-sdk/anthropic oldugu icin thinking secimi
-    `thinking.budgetTokens` ile yazilir; SDK bunu govdeye
-    `thinking: {type:"enabled", budget_tokens:N}` olarak cevirir. Gateway de
-    tam olarak bu alani okur (_reasoning_from_client).
+        AnthropicMessages.lowerThinking:
+          providerOptions?.anthropic?.thinking -> {type:"enabled",budget_tokens:N}
 
-    ONCESI: modellerin options/variants alani hic yazilmadigi icin opencode
-    model secici thinking secenegini GOSTERMIYORDU.
+    Dolayisiyla varyant degeri `thinking.budgetTokens` icermeli; SDK govdeye
+    `thinking: {type:"enabled", budget_tokens:N}` cevirir, gateway de tam
+    olarak bu alani okur.
+
+    ONCESI: modellerde options/variants alani hic yazilmadigi icin opencode
+    model secicide thinking secenegini HIC gostermiyordu ve gateway de
+    istemciden gelen effort'u okumuyordu.
     """
     return {
         "off": {"thinking": {"type": "disabled"}},
         "low": {"thinking": {"type": "enabled", "budgetTokens": 4096}},
         "medium": {"thinking": {"type": "enabled", "budgetTokens": 10240}},
         "high": {"thinking": {"type": "enabled", "budgetTokens": 16384}},
+        "max": {"thinking": {"type": "enabled", "budgetTokens": 24576}},
+    }
+
+
+# opencode ConfigProviderV1.Model semasi (binary'den cikarildi):
+#   id, name, family, release_date, attachment, reasoning, temperature,
+#   tool_call, interleaved, cost, limit, modalities, experimental, status,
+#   provider, options, headers, variants
+# `reasoning` opencode'da varsayilan FALSE; isaretlenmezse model "dusunen
+# model" sayilmaz ve thinking arayuzu acilmaz.
+def model_capabilities() -> dict:
+    return {
+        "reasoning": True,
+        "temperature": True,
+        "tool_call": True,
+        "attachment": False,
+        "limit": {"context": 200000, "output": 32000},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
     }
 
 
@@ -142,7 +172,7 @@ def main() -> int:
     for mid, name in models.items():
         entry = m.setdefault(mid, {})
         entry["name"] = name
-        entry["tool_call"] = True
+        entry.update(model_capabilities())
         entry["variants"] = thinking_variants()
     provider["ox"] = ox
 
