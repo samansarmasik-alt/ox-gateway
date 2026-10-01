@@ -1874,6 +1874,9 @@ def _reasoning_from_client(body: dict) -> tuple[dict | None, bool]:
         if str(th.get("type") or "").lower() == "disabled":
             return None, True
         raw = th.get("budget_tokens")
+        if raw is None:
+            # bazi SDK'lar camelCase gonderiyor (budgetTokens)
+            raw = th.get("budgetTokens")
         if raw:
             try:
                 n = int(raw)
@@ -2411,6 +2414,7 @@ async def anthropic_messages(request: Request):
                     "provider": get_provider()["name"],
                     "model": cand_model,
                     "requested_model": model,
+        "reasoning_sent": payload.get("reasoning"),
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
                     "finish_reason": finish_reason,
@@ -2437,6 +2441,7 @@ async def anthropic_messages(request: Request):
                     "path": "/v1/messages", "mode": get_active_mode(),
                     "provider": get_provider()["name"], "model": cand_model,
                     "requested_model": model,
+        "reasoning_sent": payload.get("reasoning"),
                     "finish_reason": finish_reason, "stop_reason": stop_reason,
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
@@ -2499,6 +2504,7 @@ async def anthropic_messages(request: Request):
                 "provider": get_provider()["name"],
                 "model": last_model,
                 "requested_model": model,
+        "reasoning_sent": payload.get("reasoning"),
                 "client_max_tokens": body.get("max_tokens"),
                 "sent_max_tokens": payload.get("max_tokens"),
                 "empty_stream": True,
@@ -2547,6 +2553,7 @@ async def anthropic_messages(request: Request):
         "provider": get_provider()["name"],
         "model": model,
         "requested_model": model,
+        "reasoning_sent": payload.get("reasoning"),
         "client_max_tokens": body.get("max_tokens"),
         "sent_max_tokens": payload.get("max_tokens"),
         "finish_reason": finish,

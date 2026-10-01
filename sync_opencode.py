@@ -63,6 +63,30 @@ def _fallbacks() -> list[tuple[str, str]]:
     return []
 
 
+def thinking_variants() -> dict:
+    """Model basina thinking secenekleri (opencode model secici bunlari gosterir).
+
+    OpenCode'un kendi kodundan cikarildi (binary icinde dogrulandi):
+
+        case "@ai-sdk/anthropic":
+          return { thinking: { type: "enabled", budgetTokens: Z } }
+
+    Yani provider npm'i @ai-sdk/anthropic oldugu icin thinking secimi
+    `thinking.budgetTokens` ile yazilir; SDK bunu govdeye
+    `thinking: {type:"enabled", budget_tokens:N}` olarak cevirir. Gateway de
+    tam olarak bu alani okur (_reasoning_from_client).
+
+    ONCESI: modellerin options/variants alani hic yazilmadigi icin opencode
+    model secici thinking secenegini GOSTERMIYORDU.
+    """
+    return {
+        "off": {"thinking": {"type": "disabled"}},
+        "low": {"thinking": {"type": "enabled", "budgetTokens": 4096}},
+        "medium": {"thinking": {"type": "enabled", "budgetTokens": 10240}},
+        "high": {"thinking": {"type": "enabled", "budgetTokens": 16384}},
+    }
+
+
 def target_path() -> pathlib.Path:
     env = __import__("os").environ.get("OPENCODE_CONFIG")
     if env:
@@ -119,6 +143,7 @@ def main() -> int:
         entry = m.setdefault(mid, {})
         entry["name"] = name
         entry["tool_call"] = True
+        entry["variants"] = thinking_variants()
     provider["ox"] = ox
 
     if args.dry_run:

@@ -347,6 +347,59 @@ class TestClientEffortWins(unittest.TestCase):
                 gateway.CONFIG["reasoning_effort_by_model"] = per
 
 
+class TestThinkingVariantsShape(unittest.TestCase):
+    """sync_opencode'in opencode.json'a yazdigi thinking varyantlari.
+
+    OpenCode'un kendi kodundan cikarildi (binary'de dogrulandi):
+        case "@ai-sdk/anthropic":
+          return { thinking: { type: "enabled", budgetTokens: Z } }
+
+    Dolayisiyla varyant degeri `thinking.budgetTokens` icermeli; SDK bunu
+    govdeye `thinking: {type:"enabled", budget_tokens:N}` olarak cevirir ve
+    gateway o alani okur.
+    """
+
+    def setUp(self):
+        import sync_opencode
+        self.v = sync_opencode.thinking_variants()
+
+    def test_off_variant_disables_thinking(self):
+        self.assertEqual(self.v["off"], {"thinking": {"type": "disabled"}})
+
+    def test_enabled_variants_use_budget_tokens(self):
+        for lvl in ("low", "medium", "high"):
+            with self.subTest(level=lvl):
+                th = self.v[lvl]["thinking"]
+                self.assertEqual(th["type"], "enabled")
+                self.assertIsInstance(th["budgetTokens"], int)
+                self.assertGreater(th["budgetTokens"], 0)
+
+    def test_budgets_increase_with_level(self):
+        self.assertLess(self.v["low"]["thinking"]["budgetTokens"],
+                        self.v["medium"]["thinking"]["budgetTokens"])
+        self.assertLess(self.v["medium"]["thinking"]["budgetTokens"],
+                        self.v["high"]["thinking"]["budgetTokens"])
+
+    def test_every_variant_is_honoured_by_gateway(self):
+        """Varyant degerleri gateway'de beklenen reasoning'e donusmeli."""
+        M = "stealth/space-bunny-alpha"
+        self.assertIsNone(gateway._reasoning_config(
+            {"thinking": self.v["off"]["thinking"]}, 32000, M))
+        for lvl in ("low", "medium", "high"):
+            with self.subTest(level=lvl):
+                n = self.v[lvl]["thinking"]["budgetTokens"]
+                rc = gateway._reasoning_config(
+                    {"thinking": self.v[lvl]["thinking"]}, 32000, M)
+                self.assertEqual(rc, {"max_tokens": n})
+
+    def test_camelcase_budget_also_accepted(self):
+        """Bazi SDK'lar budgetTokens (camelCase) gonderiyor."""
+        self.assertEqual(
+            gateway._reasoning_config(
+                {"thinking": {"type": "enabled", "budgetTokens": 8192}}, 32000),
+            {"max_tokens": 8192})
+
+
 class TestPerModelEffort(unittest.TestCase):
     """Model basina thinking ayari: opencode'da model secerken effort secmek."""
 
