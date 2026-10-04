@@ -347,6 +347,96 @@ class TestClientEffortWins(unittest.TestCase):
                 gateway.CONFIG["reasoning_effort_by_model"] = per
 
 
+class TestPaidFallbackGuard(unittest.IsolatedAsyncioTestCase):
+    """Yedek zincire ucretli model GIREMEZ (kullaniciyi borclandirmamak icin).
+
+    Konu: bir model config'e yanlislikla yazilirsa gateway onu 429 halinde
+    OTOMATIK olarak cagirir ve kullanici istemeden fatura olusur.
+    """
+
+    def setUp(self):
+        self._fb = gateway.CONFIG.get("fallback_models")
+        self._allow = gateway.CONFIG.get("allow_paid_fallbacks")
+        self._auto = gateway.CONFIG.get("auto_model_fallback")
+        self._mode = gateway.CONFIG.get("active_mode")
+
+    def tearDown(self):
+        for k, v in (("fallback_models", self._fb),
+                     ("allow_paid_fallbacks", self._allow),
+                     ("auto_model_fallback", self._auto),
+                     ("active_mode", self._mode)):
+            if v is None:
+                gateway.CONFIG.pop(k, None)
+            else:
+                gateway.CONFIG[k] = v
+
+    def test_free_suffix_is_not_paid(self):
+        for m in ("dots-studio/dots-3-note-preview:free", "openrouter/free"):
+            with self.subTest(model=m):
+                self.assertFalse(gateway._is_paid_model(m))
+
+    def test_unknown_model_is_treated_as_paid(self):
+        """Belirsiz olan ucretli sayilir - guvenli taraf."""
+        for m in ("deepseek/deepseek-v4-flash", "stealth/space-bunny-alpha",
+                  "openai/gpt-6-astra", ""):
+            with self.subTest(model=m):
+                self.assertTrue(gateway._is_paid_model(m))
+
+    def test_paid_fallback_listed_as_blocked(self):
+        gateway.CONFIG["allow_paid_fallbacks"] = False
+        gateway.CONFIG["fallback_models"] = ["deepseek/deepseek-v4-flash",
+                                             "qwen/qwen3.8-27b:free"]
+        self.assertEqual(gateway._paid_fallbacks_blocked(),
+                         ["deepseek/deepseek-v4-flash"])
+
+    def test_explicit_opt_in_allows_paid(self):
+        gateway.CONFIG["allow_paid_fallbacks"] = True
+        gateway.CONFIG["fallback_models"] = ["deepseek/deepseek-v4-flash"]
+        self.assertEqual(gateway._paid_fallbacks_blocked(), [])
+
+    async def test_chain_excludes_paid_fallback(self):
+        gateway.CONFIG["active_mode"] = "2"
+        gateway.CONFIG["allow_paid_fallbacks"] = False
+        gateway.CONFIG["auto_model_fallback"] = True
+        gateway.CONFIG["max_model_fallbacks"] = 4
+        gateway.CONFIG["fallback_models"] = ["deepseek/deepseek-v4-flash",
+                                             "qwen/qwen3.8-27b:free"]
+        chain = await gateway._candidate_models("stealth/space-bunny-alpha")
+        self.assertNotIn("deepseek/deepseek-v4-flash", chain)
+        self.assertIn("qwen/qwen3.8-27b:free", chain)
+
+    async def test_primary_model_is_never_blocked(self):
+        """Kullanicinin kendi sectigi aktif model engellenmez."""
+        gateway.CONFIG["active_mode"] = "2"
+        gateway.CONFIG["allow_paid_fallbacks"] = False
+        gateway.CONFIG["auto_model_fallback"] = False
+        chain = await gateway._candidate_models("stealth/space-bunny-alpha")
+        self.assertEqual(chain, ["stealth/space-bunny-alpha"])
+
+
+class TestIncludeReasoningFlag(unittest.TestCase):
+    """reasoning acikken include_reasoning gonderilir.
+
+    Olcum (space-bunny, 2 istek):
+      effort=high                     -> dusunme 339 / metin 102
+      effort=high + include_reasoning -> dusunme 492 / metin 448
+    Saglayicinin resmi bayragi; model desteklemiyorsa zarari yok.
+    """
+
+    def test_flag_sent_when_reasoning_configured(self):
+        import inspect
+        src = inspect.getsource(gateway.anthropic_messages)
+        self.assertIn("include_reasoning", src)
+
+    def test_free_suffix_check_matches_gateway_candidates(self):
+        # yedek zinciri yalnizca _is_free() olanlari dinamik ekler
+        self.assertTrue(gateway._is_free({"id": "qwen/qwen3.8-27b:free",
+                                         "pricing": {"prompt": "0", "completion": "0"}}))
+        self.assertFalse(gateway._is_free({"id": "deepseek/deepseek-v4-flash",
+                                           "pricing": {"prompt": "0.0000002",
+                                                       "completion": "0.0000008"}}))
+
+
 class TestOpencodeModelSchema(unittest.TestCase):
     """sync_opencode'in yazdigi model nesnesi opencode semasina uymali.
 

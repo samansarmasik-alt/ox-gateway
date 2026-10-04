@@ -32,7 +32,10 @@
   "fallback_models": [
     "dots-studio/dots-3-note-preview:free",
     "liquid/lfm-2.5-2.6b:free",
-    "nvidia/nemotron-3.5-lightning:free"
+    "nvidia/nemotron-3.5-lightning:free",
+    "qwen/qwen3.8-27b:free",
+    "openrouter/free"
   ],
-  "reasoning_effort": "high"
+  "reasoning_effort": "high",
+  "allow_paid_fallbacks": false
 }

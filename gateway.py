@@ -849,10 +849,40 @@ async def _await_truncation_retry(delay: float = 0.4):
 
 
 
+def _is_paid_model(model_id: str) -> bool:
+    """Model ucretli mi? Belirsiz olan UCRETLI sayilir.
+
+    Yalnizca acikca ucretsiz isaretlenenler bedava kabul edilir:
+      * ':free' soneki (dots-studio/dots-3-note-preview:free)
+      * '/free' soneki (openrouter/free)
+
+    Neden bu kadar katı: yedek zincirine ucretli bir model girerse gateway
+    onu OTOMATIK olarak cagirir; kullanici istemeden fatura olusur.
+    Kullanici acikça config'e yaziyorsa bu bir kararidir, ama varsayilan
+    guvenli tarafta olmalidir.
+    """
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return True
+    return not (mid.endswith(":free") or mid.endswith("/free"))
+
+
+def _paid_fallbacks_blocked() -> list[str]:
+    """Config'te olup da ucretsiz olmadigi icin zincire alinmayanlar."""
+    if CONFIG.get("allow_paid_fallbacks", False):
+        return []
+    return [m for m in (CONFIG.get("fallback_models") or []) if _is_paid_model(m)]
+
+
 async def _candidate_models(model: str | None) -> list[str]:
     """Birincil model + 429 durumunda denenecek ucretsiz yedek modeller.
     Yedekler once config'deki 'fallback_models'dan, sonra OpenRouter'un
-    ucretsiz listesinden dinamik cekilir. Atria modunda (1) yedek uretilmez."""
+    ucretsiz listesinden dinamik cekilir. Atria modunda (1) yedek uretilmez.
+
+    GUVENLIK: yedek zincire UCRETSIZ olmayan model girmez. Kullanici
+    config.json'a ucretli model yazdiysa ve 'allow_paid_fallbacks' acik
+    degilse o model atlanir ve bir kez uyari yazilir. Aksi halde gateway
+    kullanici istemeden ucretli model cagirip fatura olusturur."""
     primary = model or get_active_model()
     if get_active_mode() == "1":
         return [primary]
@@ -860,7 +890,13 @@ async def _candidate_models(model: str | None) -> list[str]:
     if not CONFIG.get("auto_model_fallback", True):
         return cands
     limit = max(1, int(CONFIG.get("max_model_fallbacks", 4)))
-    extra: list[str] = [m for m in (CONFIG.get("fallback_models") or [])]
+    blocked = _paid_fallbacks_blocked()
+    if blocked:
+        print(f"[ox-gateway] UYARI: fallback_models icindeki ucretli modeller "
+              f"zincire ALINMADI (allow_paid_fallbacks: false): "
+              f"{', '.join(blocked[:4])}")
+    extra: list[str] = [m for m in (CONFIG.get("fallback_models") or [])
+                       if m not in blocked]
     try:
         raw = await fetch_openrouter_models()
         extra += [m.get("id", "") for m in raw if _is_free(m)]
@@ -2211,6 +2247,12 @@ async def anthropic_messages(request: Request):
                            model)
     if rc:
         payload["reasoning"] = rc
+        # OpenRouter'in resmi bayragi: reasoning iceriginin cevapta
+        # DONMESINI garanti eder. Olcum (space-bunny, 2 istek):
+        #   effort=high                     -> dusunme 339 / metin 102
+        #   effort=high + include_reasoning -> dusunme 492 / metin 448
+        # Model reasoning'i desteklemiyorsa zarari yoktur.
+        payload["include_reasoning"] = True
     stall_s = max(5.0, float(CONFIG.get("stall_timeout", 45)))
 
     # ---- Streaming: OpenAI chunk'larini Anthropic eventlerine cevir ----
@@ -2235,6 +2277,7 @@ async def anthropic_messages(request: Request):
             cur_tool = None                 # su an akilan upstream tool kimligi (id/index)
             stop_reason = "end_turn"
             usage_out = 0
+            reasoning_tokens_out = 0
             finish_reason = None
             upstream_error: str | None = None
             text_chars = 0
@@ -2371,6 +2414,14 @@ async def anthropic_messages(request: Request):
                                 think_chars += len(rt)
                             if j.get("usage"):
                                 usage_out = j["usage"].get("completion_tokens", usage_out)
+                                # reasoning_tokens saglayicinin modelin GERCEKTEN
+                                # dusunup dusunmedigini soyler. Reasoning modeli
+                                # OLMAYAN modellerde 0 gelir (olculdu:
+                                # space-bunny -> 0, deepseek-v4-flash -> 135).
+                                rtok = (j["usage"].get("completion_tokens_details")
+                                        or {}).get("reasoning_tokens")
+                                if isinstance(rtok, int):
+                                    reasoning_tokens_out = rtok
                     elif line.startswith("data: [DONE]"):
                         break
                     try:
@@ -2421,6 +2472,7 @@ async def anthropic_messages(request: Request):
                     "stop_reason": stop_reason,
                     "text_chars": text_chars,
                     "think_chars": think_chars,
+                    "reasoning_tokens": reasoning_tokens_out,
                     "tool_uses": tool_count,
                     "output_tokens": usage_out,
                     "has_text": text_chars > 0,
@@ -2446,6 +2498,7 @@ async def anthropic_messages(request: Request):
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
                     "text_chars": text_chars, "think_chars": think_chars,
+                    "reasoning_tokens": reasoning_tokens_out,
                     "tool_uses": tool_count, "output_tokens": usage_out,
                     "has_text": text_chars > 0, "has_tool_use": tool_count > 0,
                     "mid_stream_error": str(e)[:200],
