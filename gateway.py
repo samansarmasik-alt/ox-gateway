@@ -263,7 +263,34 @@ class Throttle:
             self._last = time.monotonic()
 
 
-THROTTLE = Throttle(CONFIG.get("pace_ms", 100))
+THROTTLE = Throttle(CONFIG.get("pace_ms", 0))
+
+# Gateway'in kendi ekledigi gecikmeden ayirt etmek icin: upstream POST
+# suresi disaridan gorulebilir. /api/diag.last.upstream_ms doner.
+LAST_UPSTREAM_MS: dict = {}
+
+# Bir tur icin yapilan upstream DENEME sayisi. Gecikmeyi ayristirmak icin:
+# yuksek deger, ilk modelin basarisiz olup zincirde yurudugu anlamina gelir
+# (her deneme 1-5 sn ekler). /api/diag.last.upstream_attempts doner.
+LAST_ATTEMPTS: dict = {"n": 0}
+
+# Yeniden deneme arası bekleme. ONCESI sabit 3 sn idi ve 'max_retries'
+# turu basina tekrarlaniyordu -> en kotu durumda 6 sn BOŞ bekleme, kullanici
+# "baya yavas" diyordu. Bekleme artik:
+#   * gunluk limit / 429 gorduksek -> biraz bekler (gercekten faydali)
+#   * diger hatalarda -> kisa (varsayilan 250ms), anahtar degistirmek zaten
+#     yeterli oldugu icin uzun beklemeye gerek yok
+_RETRY_SLEEP_S = max(0.0, float(CONFIG.get("retry_sleep_ms", 250)) / 1000.0)
+
+
+async def _retry_sleep(last_err: str | None = "") -> None:
+    """Tur basina bekleme: rate-limit gorduksek uzun, aksi halde kisa."""
+    s = _RETRY_SLEEP_S
+    low = (last_err or "").lower()
+    if "429" in low or "daily" in low or "rate" in low:
+        s = max(s, MAX_COOLDOWN_S)
+    if s > 0:
+        await asyncio.sleep(s)
 
 
 def _new_stats() -> dict:
@@ -1056,7 +1083,7 @@ async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> 
                 pool.mark_failed(key)
                 pool.record(key, ms, ok=False)
         if rnd < rounds - 1:
-            await asyncio.sleep(MAX_COOLDOWN_S)
+            await _retry_sleep(last_err)
     if CONFIG.get("graceful_degradation", True):
         print("[ox-gateway] atria yanit vermedi; graceful cevap donduruluyor")
         return {
@@ -1250,7 +1277,7 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
         if rnd < rounds - 1:
             print(f"[ox-gateway] zincir tukendi, {MAX_COOLDOWN_S:.0f}s sonra tekrar denenecek "
                   f"(tur {rnd + 2}/{rounds})")
-            await asyncio.sleep(MAX_COOLDOWN_S)
+            await _retry_sleep(last_err)
 
     if CONFIG.get("graceful_degradation", True):
         print("[ox-gateway] hicbir model yanit vermedi; agente hata yerine gecerli cevap donduruluyor")
@@ -1308,6 +1335,8 @@ async def open_stream(payload: dict, model: str | None = None, pool=None):
                                 break
                             continue
 
+                        LAST_UPSTREAM_MS["stream"] = round(
+                            (time.perf_counter() - t0) * 1000, 1)
                         # Ilk token bekleniyor; gec kalirsa bu key yavas -> failover
                         line_iter = resp.aiter_lines()
                         try:
@@ -1340,7 +1369,7 @@ async def open_stream(payload: dict, model: str | None = None, pool=None):
         if rnd < rounds - 1:
             print(f"[ox-gateway] stream: zincir tukendi, {MAX_COOLDOWN_S:.0f}s sonra tekrar denenecek "
                   f"(tur {rnd + 2}/{rounds})")
-            await asyncio.sleep(MAX_COOLDOWN_S)
+            await _retry_sleep(last_err)
 
     raise HTTPException(status_code=502, detail=f"Tum keyler/modeller basarisiz. Son hata: {last_err}")
 
@@ -2537,6 +2566,7 @@ async def anthropic_messages(request: Request):
                     "model": cand_model,
                     "requested_model": model,
         "reasoning_sent": payload.get("reasoning"),
+                    "upstream_ms": LAST_UPSTREAM_MS.get("stream"),
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
                     "finish_reason": finish_reason,
@@ -2564,7 +2594,9 @@ async def anthropic_messages(request: Request):
                     "path": "/v1/messages", "mode": get_active_mode(),
                     "provider": get_provider()["name"], "model": cand_model,
                     "requested_model": model,
-        "reasoning_sent": payload.get("reasoning"),
+                    "reasoning_sent": payload.get("reasoning"),
+                    "upstream_ms": LAST_UPSTREAM_MS.get("stream"),
+                    "upstream_attempts": LAST_ATTEMPTS["n"],
                     "finish_reason": finish_reason, "stop_reason": stop_reason,
                     "client_max_tokens": body.get("max_tokens"),
                     "sent_max_tokens": payload.get("max_tokens"),
@@ -2572,6 +2604,7 @@ async def anthropic_messages(request: Request):
                     "reasoning_tokens": reasoning_tokens_out,
                     "tool_uses": tool_count, "output_tokens": usage_out,
                     "has_text": text_chars > 0, "has_tool_use": tool_count > 0,
+                    "upstream_attempts": LAST_ATTEMPTS["n"],
                     "mid_stream_error": str(e)[:200],
                 })
                 try:
@@ -2605,7 +2638,10 @@ async def anthropic_messages(request: Request):
             cands = await _candidate_models(model)
             last_err: str | None = None
             last_model: str | None = None
+            attempts = 0
             for idx, cand in enumerate(cands):
+                attempts += 1
+                LAST_ATTEMPTS["n"] = attempts
                 try:
                     async for chunk in _sse_attempt(cand):
                         yield chunk
@@ -2628,7 +2664,9 @@ async def anthropic_messages(request: Request):
                 "provider": get_provider()["name"],
                 "model": last_model,
                 "requested_model": model,
+                "upstream_attempts": attempts,
         "reasoning_sent": payload.get("reasoning"),
+                    "upstream_ms": LAST_UPSTREAM_MS.get("stream"),
                 "client_max_tokens": body.get("max_tokens"),
                 "sent_max_tokens": payload.get("max_tokens"),
                 "empty_stream": True,
@@ -2678,6 +2716,7 @@ async def anthropic_messages(request: Request):
         "model": model,
         "requested_model": model,
         "reasoning_sent": payload.get("reasoning"),
+                    "upstream_ms": LAST_UPSTREAM_MS.get("stream"),
         "client_max_tokens": body.get("max_tokens"),
         "sent_max_tokens": payload.get("max_tokens"),
         "finish_reason": finish,

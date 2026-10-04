@@ -8,14 +8,14 @@
   "protocol": "openai",
   "gateway_api_key": "",
   "api_keys": [],
-  "pace_ms": 100,
+  "pace_ms": 0,
   "first_token_ms": 20000,
   "stall_timeout": 45,
   "request_timeout": 120,
   "cooldown_seconds": 3,
   "cooldown_every": 3,
   "rest_seconds": 3,
-  "max_retries": 3,
+  "max_retries": 2,
   "heal_retries": 2,
   "graceful_degradation": true,
   "min_token_budget": 1024,
@@ -38,5 +38,6 @@
   ],
   "reasoning_effort": "high",
   "allow_paid_fallbacks": false,
-  "reasoning_budget_to_effort": true
+  "reasoning_budget_to_effort": true,
+  "retry_sleep_ms": 250
 }
