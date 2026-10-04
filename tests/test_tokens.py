@@ -442,6 +442,59 @@ class TestBudgetToEffortMapping(unittest.TestCase):
             {"effort": "medium"})
 
 
+class TestDefaultModelAlias(unittest.TestCase):
+    """"default" takma adi -> anlik aktif model.
+
+    Kullanici modeli dashboard'dan secmek istiyor; opencode'da her
+    oturumda model secmek zorunda kalmamali.
+    """
+
+    def setUp(self):
+        self._pm = gateway.CONFIG.get("provider_models")
+        gateway.CONFIG.setdefault("provider_models", {})
+        gateway.CONFIG["provider_models"]["2"] = "vendor/aktif-model"
+
+    def tearDown(self):
+        if self._pm is None:
+            gateway.CONFIG.pop("provider_models", None)
+        else:
+            gateway.CONFIG["provider_models"] = self._pm
+
+    def test_aliases_resolve_to_active_model(self):
+        for ad in ("default", "ox/default", "auto", "ox/auto", "DEFAULT", ""):
+            with self.subTest(alias=ad):
+                self.assertEqual(gateway._resolve_model_alias(ad),
+                                 "vendor/aktif-model")
+
+    def test_none_resolves_to_active_model(self):
+        self.assertEqual(gateway._resolve_model_alias(None),
+                         "vendor/aktif-model")
+
+    def test_real_model_passes_through_untouched(self):
+        for m in ("stealth/space-bunny-alpha", "Atria-Dawn-Preview",
+                  "openai/gpt-6-astra"):
+            with self.subTest(model=m):
+                self.assertEqual(gateway._resolve_model_alias(m), m)
+
+    def test_default_variants_present(self):
+        """opencode her modelde variants bekliyor; yoksa thinking arayuzu acilmaz."""
+        v = gateway._default_variants()
+        self.assertEqual(v["off"], {"thinking": {"type": "disabled"}})
+        for lvl in ("low", "medium", "high", "max"):
+            self.assertEqual(v[lvl]["thinking"]["type"], "enabled")
+
+    def test_default_alias_is_not_routed_to_atria_in_mode2(self):
+        gateway.CONFIG["active_mode"] = "2"
+        eski = gateway.CONFIG.get("active_mode")
+        try:
+            self.assertFalse(gateway._should_route_atria("default"))
+        finally:
+            if eski is None:
+                gateway.CONFIG.pop("active_mode", None)
+            else:
+                gateway.CONFIG["active_mode"] = eski
+
+
 class TestPaidFallbackGuard(unittest.IsolatedAsyncioTestCase):
     """Yedek zincire ucretli model GIREMEZ (kullaniciyi borclandirmamak icin).
 

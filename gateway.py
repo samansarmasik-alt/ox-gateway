@@ -235,8 +235,35 @@ def _is_atria_model(model: str | None) -> bool:
     return "atria" in m
 
 
+# Istemcide gorunen "sabit" model adlari. Bunlar gateway'in ANLIK aktif
+# modeline cozumlenir; yani modeli dashboard'dan bir kez secmek yeter,
+# opencode/Claude Code tarafinda her seferinde model secmeye gerek kalmaz.
+DEFAULT_MODEL_ALIASES = {"default", "ox/default", "auto", "ox/auto",
+                         "gateway/default", "default/ox"}
+
+
+def _resolve_model_alias(model: str | None) -> str:
+    """"default" gibi takma adlari anlik aktif modele cozer.
+
+    ONCESI: opencode'da her oturumda model secmek gerekiyordu; dashboard'da
+    secilen model degistiginde opencode'daki liste bayatti.
+    """
+    m = (model or "").strip()
+    if not m or m.lower() in DEFAULT_MODEL_ALIASES:
+        return get_active_model()
+    # "vendor/model" biciminde gelen "ox/<id>" onekini de temizle
+    if m.lower().startswith("ox/") and m.lower()[3:] in DEFAULT_MODEL_ALIASES:
+        return get_active_model()
+    return m
+
+
+def _is_default_alias(model: str | None) -> bool:
+    return (model or "").strip().lower() in DEFAULT_MODEL_ALIASES
+
+
 def _should_route_atria(model: str | None) -> bool:
     """Aktif mod 1 ise hep Atria; degilse model adi Atria ise yine Atria."""
+    model = _resolve_model_alias(model)
     if get_active_mode() == "1":
         return True
     return _is_atria_model(model)
@@ -2294,7 +2321,7 @@ async def anthropic_messages(request: Request):
     except Exception:
         raise HTTPException(400, "Gecersiz JSON")
 
-    model = body.get("model") or get_active_model()
+    model = _resolve_model_alias(body.get("model"))
     # ---- Atria: Anthropic format dogrudan gider, ceviri yok (aktif mod 1 veya model Atria ise) ----
     if _should_route_atria(model):
         stall_s = max(5.0, float(CONFIG.get("stall_timeout", 45)))
@@ -2809,14 +2836,44 @@ def _is_free(m: dict) -> bool:
         return False
 
 
+def _default_variants() -> dict:
+    """'default' seceneginin thinking varyantlari.
+
+    Yedek model olmadigi icin satis varyantlari burada anlamli degil, ama
+    opencode her modelde 'variants' bekliyor; yoksa reasoning arayuzu acilmaz.
+    Bu yuzden ayni seti (thinking tabanli) kullaniriz.
+    """
+    return {
+        "off": {"thinking": {"type": "disabled"}},
+        "low": {"thinking": {"type": "enabled", "budgetTokens": 4096}},
+        "medium": {"thinking": {"type": "enabled", "budgetTokens": 10240}},
+        "high": {"thinking": {"type": "enabled", "budgetTokens": 16384}},
+        "max": {"thinking": {"type": "enabled", "budgetTokens": 24576}},
+    }
+
+
 async def models_payload() -> dict:
     default = get_active_model()
+    # "default" sabit secenek: istemci tarafinda model secmeye gerek kalmasin.
+    # Gateway bunu anlik aktif modele cozer; dashboard'dan model degistirince
+    # opencode/Claude Code tarafi OTOMATIK olarak yeni modeli kullanir.
+    base_opts = {"reasoning": True, "temperature": True, "tool_call": True,
+                 "attachment": False, "limit": {"context": 200000,
+                                                "output": _MAX_OUTPUT_TOKENS},
+                 "modalities": {"input": ["text", "image"], "output": ["text"]}}
+    default_entry = {
+        "id": "default", "name": "⭐ default (dashboard'daki model)",
+        "free": False, "default": False, "alias": True,
+        "resolves_to": default, **base_opts,
+        "variants": _default_variants(),
+    }
     # 1. mod (Atria): model listesi bilinmiyor, varsayilani dondur
     if get_active_mode() == "1":
-        return {"default": default, "total": 1, "active_mode": "1",
+        return {"default": default, "total": 2, "active_mode": "1",
                 "provider": "atria", "provider_url": ATRIA_URL,
-                "models": [{"id": default, "name": f"⭐ {default} (varsayılan)",
-                            "free": False, "default": True}]}
+                "models": [default_entry,
+                           {"id": default, "name": f"⭐ {default} (varsayılan)",
+                            "free": False, "default": True, **base_opts}]}
     raw = await fetch_openrouter_models()
     items = [
         {
@@ -2830,7 +2887,9 @@ async def models_payload() -> dict:
     ]
     items.sort(key=lambda x: x["name"].lower())
     free_first = [m for m in items if m["free"]] + [m for m in items if not m["free"]]
-    ordered = [{"id": default, "name": f"⭐ {default} (varsayılan)", "free": False, "default": True}] + \
+    ordered = [default_entry,
+               {"id": default, "name": f"⭐ {default} (varsayılan)",
+                "free": False, "default": True, **base_opts}] + \
               [m for m in free_first if m["id"] != default]
     # Modele ozel thinking ayarini her modelle birlikte dondur: dashboard
     # model listesinden yaninda effort secici gosterebilsin.
@@ -2839,8 +2898,9 @@ async def models_payload() -> dict:
     glob = _reasoning_current()
     for it in ordered:
         it["effort"] = per.get(it["id"], glob)
-    return {"default": default, "total": len(ordered), "models": ordered,
-            "reasoning_effort": glob, "by_model": per}
+    default_entry["effort"] = glob
+    return {"default": "default", "active_model": default, "total": len(ordered),
+            "models": ordered, "reasoning_effort": glob, "by_model": per}
 
 
 def _model_list() -> list[str]:
@@ -2930,9 +2990,11 @@ async def chat_completions(request: Request, req: ChatRequest):
 
     # ---- Streaming (SSE) ----
     if req.stream:
+        # "default" takma adi -> anlik aktif model (dashboard'dan secilen)
+        req_model = _resolve_model_alias(req.model)
         # Atria SSE -> OpenAI SSE cevirisi (aktif mod 1 veya model Atria ise)
-        if _should_route_atria(req.model or get_active_model()):
-            model_a = req.model or get_active_model()
+        if _should_route_atria(req_model):
+            model_a = req_model
             anth_body = _openai_to_anthropic({**payload, "model": model_a}, model_a)
             stall_a = max(5.0, float(CONFIG.get("stall_timeout", 45)))
 
@@ -3039,7 +3101,7 @@ async def chat_completions(request: Request, req: ChatRequest):
             # Response baslamadan once hata cikabilir; HTTPException firlatmak
             # yerine OpenAI-uyumlu error chunk'i + [DONE] akiyoruz.
             try:
-                client, resp, line_iter, first_line = await open_stream(payload, req.model)
+                client, resp, line_iter, first_line = await open_stream(payload, req_model)
             except Exception:
                 # Hata asla istemciye hata olarak iletilmez: gecerli minimal akis
                 for chunk in _openai_graceful_chunks():
@@ -3101,7 +3163,7 @@ async def chat_completions(request: Request, req: ChatRequest):
         )
 
     # ---- Normal (OpenRouter'in OpenAI-uyumlu cevabi aynen gecer) ----
-    result = await call_openrouter(payload, req.model)
+    result = await call_openrouter(payload, req_model)
     return result
 
 
@@ -3119,7 +3181,7 @@ async def agent_run(req: AgentRequest, request: Request):
         payload["temperature"] = req.temperature
     if req.max_tokens is not None:
         payload["max_tokens"] = req.max_tokens
-    result = await call_openrouter(payload, req.model)
+    result = await call_openrouter(payload, req_model)
     try:
         msg = result["choices"][0]["message"]
         text = msg.get("content") or msg.get("reasoning") or ""

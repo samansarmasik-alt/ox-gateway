@@ -36,7 +36,11 @@ def build_models(conn: dict) -> dict:
     pm = conn.get("provider_models") or {}
     m1 = pm.get("1") or "Atria-Dawn-Preview"
     m2 = pm.get("2") or "stealth/space-bunny-alpha"
+    # 'default' sabit secenek: modeli dashboard'dan secmek yeter, opencode'da
+    # her oturumda model secmeye gerek kalmaz. Gateway anlik aktif modeli
+    # kullanir (bkz. gateway.py _resolve_model_alias).
     models = {
+        "default": f"⭐ default (dashboard: {m2.split('/')[-1]})",
         m1: "Atria Dawn Preview (Mod 1, atria-asi.ai)",
         m2: "Space Bunny Alpha (Mod 2, stealth)",
     }
