@@ -37,5 +37,6 @@
     "openrouter/free"
   ],
   "reasoning_effort": "high",
-  "allow_paid_fallbacks": false
+  "allow_paid_fallbacks": false,
+  "reasoning_budget_to_effort": true
 }

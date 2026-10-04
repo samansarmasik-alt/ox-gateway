@@ -1991,6 +1991,36 @@ def _effort_to_reasoning(raw, out_budget: int) -> dict | None:
     return {"max_tokens": _clamp_thinking_budget(n, out_budget)}
 
 
+def _budget_to_effort(n: int) -> str | None:
+    """Istemcinin thinking budget'ini OpenRouter 'effort' seviyesine cevirir.
+
+    NEDEN: OpenRouter'da 'effort' ile 'reasoning.max_tokens' ikisi birden
+    gonderilemez (HTTP 400) ve ikisi AYNI isi yapmiyor. Olcum
+    (space-bunny, ayni istemci butcesi, n=3):
+        reasoning: {effort: "xhigh"}          -> 1003 dusunme karakteri
+        reasoning: {max_tokens: 24576}        ->  870 dusunme karakteri
+        reasoning: {effort: "high"}           ->  492 (include_reasoning ile)
+    Yani saglayici 'effort' seviyesine daha cok uyar. Istemci butce
+    gonderdiginde onu seviyeye CEVIRIYORUZ; boylece opencode'daki
+    max/medium/low secimleri gercekten fark yaratiyor.
+    Esikler opencode varyantlariyla 1:1 eslesir:
+        low(4096)    -> low
+        medium(10240)-> medium
+        high(16384)  -> high
+        max(24576)   -> xhigh
+    Aradaki butceler en yakin ust seviyeye yuvarlanir.
+    """
+    if n >= 24576:
+        return "xhigh"
+    if n >= 16384:
+        return "high"
+    if n >= 10240:
+        return "medium"
+    if n > 0:
+        return "low"
+    return None
+
+
 def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS,
                       model: str | None = None) -> dict | None:
     """Thinking/reasoning ayarini cozer. Oncelik sirasi:
@@ -1999,6 +2029,12 @@ def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS,
       2. config.reasoning_effort_by_model[model] -> O MODEL icin ozel effort
       3. config.reasoning_effort -> genel varsayilan
       4. config.reasoning_max_tokens (geriye uyum)
+
+    Istemcinin gonderdigi thinking BUDGET'i, config
+    'reasoning_budget_to_effort' acikken (varsayilan) OpenRouter 'effort'
+    seviyesine cevrilir; kapaliyken oldugu gibi max_tokens olarak gider.
+    Boylece opencode'daki low/medium/high/max secimleri modelde gercekten
+    fark yaratir (olcum: effort=xhigh 1003 vs max_tokens=24576 870 karakter).
 
     ONCEKI HALI IKI YANLIS YAPIYORDU:
       1) Istemci thinking.budget_tokens gonderdiginde `return None` yapiliyordu,
@@ -2016,12 +2052,15 @@ def _reasoning_config(body: dict, out_budget: int = _MAX_OUTPUT_TOKENS,
     if rc:
         if "effort" in rc:
             eff = rc["effort"].strip().lower()
-            if eff in _THINKING_OFF:
-                return None
-            if eff not in _THINKING_EFFORTS:
+            if eff in _THINKING_OFF or eff not in _THINKING_EFFORTS:
                 return None
             return {"effort": eff}
-        return {"max_tokens": _clamp_thinking_budget(rc["max_tokens"], out_budget)}
+        n = _clamp_thinking_budget(rc["max_tokens"], out_budget)
+        if CONFIG.get("reasoning_budget_to_effort", True):
+            eff = _budget_to_effort(rc["max_tokens"])
+            if eff:
+                return {"effort": eff}
+        return {"max_tokens": n}
 
     # 2) modele ozel ayar
     per = CONFIG.get("reasoning_effort_by_model") or {}

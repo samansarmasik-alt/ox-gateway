@@ -185,23 +185,48 @@ class TestTokenBudgetPlumbing(unittest.TestCase):
                 gateway.CONFIG["reasoning_effort"] = eski_effort
 
     def test_client_thinking_budget_wins(self):
-        """Istemci thinking budget_tokens gonderdiyse O DEGER kullanilir.
+        """Istemci thinking budget_tokens gonderdiyse dikkate alinir.
 
         ONCEKI DAVRANIS (DUZELTILDI): burada None donuyordu, yani "thinking
         ACIK" diyen istemciye gateway thinking'i tamamen KAPATIYORDU.
         Claude Code bu alani sik gonderiyor; model neredeyse hic dusunmedigi
         icin suphelenilen belirti buydu.
+
+        Artik butce 'effort' seviyesine cevrilir (reasoning_max_tokens
+        kilidi kalirsa: eski hali reasoning.max_tokens gonderirdi).
         """
-        self.assertEqual(
-            gateway._reasoning_config(
-                {"thinking": {"type": "enabled", "budget_tokens": 4096}}),
-            {"max_tokens": 4096})
+        rc = None
+        eski = gateway.CONFIG.get("reasoning_budget_to_effort")
+        try:
+            gateway.CONFIG["reasoning_budget_to_effort"] = True
+            rc = gateway._reasoning_config(
+                {"thinking": {"type": "enabled", "budget_tokens": 4096}})
+            self.assertEqual(rc, {"effort": "low"})
+            # bayrak kapatilirsa eski (max_tokens) davranisa doner
+            gateway.CONFIG["reasoning_budget_to_effort"] = False
+            self.assertEqual(
+                gateway._reasoning_config(
+                    {"thinking": {"type": "enabled", "budget_tokens": 4096}}),
+                {"max_tokens": 4096})
+        finally:
+            if eski is None:
+                gateway.CONFIG.pop("reasoning_budget_to_effort", None)
+            else:
+                gateway.CONFIG["reasoning_budget_to_effort"] = eski
 
     def test_client_thinking_budget_is_clamped_to_leave_answer_room(self):
-        """Istemci 60000 dusunme isteyebilir; cevap icin yer kalmali."""
-        rc = gateway._reasoning_config(
-            {"thinking": {"type": "enabled", "budget_tokens": 60000}}, 32000)
-        self.assertEqual(rc, {"max_tokens": 19200})  # 32000 * 0.6
+        """Devasa butce cevap icin yer birakir (effort yolunda da)."""
+        gateway.CONFIG["reasoning_budget_to_effort"] = False
+        eski = gateway.CONFIG.get("reasoning_budget_to_effort")
+        try:
+            rc = gateway._reasoning_config(
+                {"thinking": {"type": "enabled", "budget_tokens": 60000}}, 32000)
+            self.assertEqual(rc, {"max_tokens": 19200})  # 32000 * 0.6
+        finally:
+            if eski is None:
+                gateway.CONFIG.pop("reasoning_budget_to_effort", None)
+            else:
+                gateway.CONFIG["reasoning_budget_to_effort"] = eski
 
     def test_thinking_disabled_type_turns_reasoning_off(self):
         self.assertIsNone(
@@ -312,13 +337,22 @@ class TestClientEffortWins(unittest.TestCase):
             {"effort": "minimal"})
 
     def test_openai_reasoning_max_tokens(self):
+        """OpenAI tarzi reasoning.max_tokens -> effort seviyesine cevrilir."""
         self.assertEqual(
             gateway._reasoning_config({"reasoning": {"max_tokens": 6000}}, 32000, self.M),
-            {"max_tokens": 6000})
+            {"effort": "low"})
 
     def test_client_effort_is_clamped(self):
-        rc = gateway._reasoning_config({"reasoning": {"max_tokens": 90000}}, 32000, self.M)
-        self.assertEqual(rc, {"max_tokens": 19200})
+        """Butce kirpma + effort'a cevirme.
+
+        ONCEKI DAVRANIS (DUZELTILDI): reasoning.max_tokens olarak
+        gonderiliyordu; saglayici effort'a daha cok uyuyor (olcum:
+        effort=xhigh 1003 vs max_tokens=24576 870 karakter). Artik butce
+        en yakin 'effort' seviyesine cevrilir.
+        """
+        self.assertEqual(
+            gateway._reasoning_config({"reasoning": {"max_tokens": 90000}}, 32000, self.M),
+            {"effort": "xhigh"})
 
     def test_client_off_variants_disable(self):
         for v in ("off", "none", "disabled", "minimalx"):
@@ -345,6 +379,67 @@ class TestClientEffortWins(unittest.TestCase):
                 gateway.CONFIG.pop("reasoning_effort_by_model", None)
             else:
                 gateway.CONFIG["reasoning_effort_by_model"] = per
+
+
+class TestBudgetToEffortMapping(unittest.TestCase):
+    """Istemci thinking BUDGET'i -> OpenRouter 'effort' seviyesi.
+
+    Neden: OpenRouter'da effort ve max_tokens birlikte gonderilemez ve
+    ikisi ayni isi yapmiyor. Olcum (space-bunny, n=3):
+        reasoning: {effort: "xhigh"}   -> 1003 dusunme karakteri
+        reasoning: {max_tokens: 24576} ->  870
+    Yani saglayici effort'a daha cok uyuyor.
+    """
+
+    def setUp(self):
+        self._flag = gateway.CONFIG.get("reasoning_budget_to_effort")
+        self._effort = gateway.CONFIG.get("reasoning_effort")
+        gateway.CONFIG["reasoning_budget_to_effort"] = True
+
+    def tearDown(self):
+        for k, v in (("reasoning_budget_to_effort", self._flag),
+                     ("reasoning_effort", self._effort)):
+            if v is None:
+                gateway.CONFIG.pop(k, None)
+            else:
+                gateway.CONFIG[k] = v
+
+    def test_opencode_variants_map_one_to_one(self):
+        import sync_opencode
+        v = sync_opencode.thinking_variants()
+        eslenme = {"low": "low", "medium": "medium", "high": "high",
+                   "max": "xhigh"}
+        for seviye, beklenen in eslenme.items():
+            with self.subTest(variant=seviye):
+                rc = gateway._reasoning_config(
+                    {"thinking": v[seviye]["thinking"]}, 32000)
+                self.assertEqual(rc, {"effort": beklenen})
+
+    def test_off_variant_still_sends_nothing(self):
+        self.assertIsNone(gateway._reasoning_config(
+            {"thinking": {"type": "disabled"}}, 32000))
+
+    def test_arbitrary_budget_rounds_up_to_nearest_level(self):
+        self.assertEqual(gateway._budget_to_effort(1), "low")
+        self.assertEqual(gateway._budget_to_effort(4095), "low")
+        self.assertEqual(gateway._budget_to_effort(4096), "low")
+        self.assertEqual(gateway._budget_to_effort(10239), "low")
+        self.assertEqual(gateway._budget_to_effort(10240), "medium")
+        self.assertEqual(gateway._budget_to_effort(16384), "high")
+        self.assertEqual(gateway._budget_to_effort(24576), "xhigh")
+        self.assertIsNone(gateway._budget_to_effort(0))
+
+    def test_flag_off_keeps_old_max_tokens_behaviour(self):
+        gateway.CONFIG["reasoning_budget_to_effort"] = False
+        rc = gateway._reasoning_config(
+            {"thinking": {"type": "enabled", "budget_tokens": 24576}}, 32000)
+        self.assertEqual(rc, {"max_tokens": 19200})
+
+    def test_explicit_effort_never_converted(self):
+        """Istemci dogrudan effort gonderiyorsa butceye cevrilmez."""
+        self.assertEqual(
+            gateway._reasoning_config({"reasoning": {"effort": "medium"}}, 32000),
+            {"effort": "medium"})
 
 
 class TestPaidFallbackGuard(unittest.IsolatedAsyncioTestCase):
@@ -541,23 +636,29 @@ class TestThinkingVariantsShape(unittest.TestCase):
                         self.v["high"]["thinking"]["budgetTokens"])
 
     def test_every_variant_is_honoured_by_gateway(self):
-        """Varyant degerleri gateway'de beklenen reasoning'e donusmeli."""
+        """Varyant degerleri gateway'de beklenen 'effort' seviyesine donusmeli.
+
+        Artik budget -> effort cevrisi var (saglayici effort'a daha cok
+        uyuyor: effort=xhigh 1003 vs max_tokens=24576 870 karakter).
+        """
         M = "stealth/space-bunny-alpha"
         self.assertIsNone(gateway._reasoning_config(
             {"thinking": self.v["off"]["thinking"]}, 32000, M))
-        for lvl in ("low", "medium", "high"):
+        beklenen = {"low": "low", "medium": "medium",
+                    "high": "high", "max": "xhigh"}
+        for lvl, eff in beklenen.items():
             with self.subTest(level=lvl):
-                n = self.v[lvl]["thinking"]["budgetTokens"]
-                rc = gateway._reasoning_config(
-                    {"thinking": self.v[lvl]["thinking"]}, 32000, M)
-                self.assertEqual(rc, {"max_tokens": n})
+                self.assertEqual(
+                    gateway._reasoning_config(
+                        {"thinking": self.v[lvl]["thinking"]}, 32000, M),
+                    {"effort": eff})
 
     def test_camelcase_budget_also_accepted(self):
         """Bazi SDK'lar budgetTokens (camelCase) gonderiyor."""
         self.assertEqual(
             gateway._reasoning_config(
                 {"thinking": {"type": "enabled", "budgetTokens": 8192}}, 32000),
-            {"max_tokens": 8192})
+            {"effort": "low"})
 
 
 class TestPerModelEffort(unittest.TestCase):
