@@ -849,17 +849,14 @@ async def _await_truncation_retry(delay: float = 0.4):
 
 
 
-def _is_paid_model(model_id: str) -> bool:
-    """Model ucretli mi? Belirsiz olan UCRETLI sayilir.
+def _looks_paid_by_name(model_id: str) -> bool:
+    """Sadece ISIMDAN yorumlar: ':free' / '/free' yoksa ucretli sayar.
 
-    Yalnizca acikca ucretsiz isaretlenenler bedava kabul edilir:
-      * ':free' soneki (dots-studio/dots-3-note-preview:free)
-      * '/free' soneki (openrouter/free)
-
-    Neden bu kadar katı: yedek zincirine ucretli bir model girerse gateway
-    onu OTOMATIK olarak cagirir; kullanici istemeden fatura olusur.
-    Kullanici acikça config'e yaziyorsa bu bir kararidir, ama varsayilan
-    guvenli tarafta olmalidir.
+    UYARI: bu tek basina guvenilir DEGIL. OpenRouter katalogunda fiyati 0
+    olan ama ':free' etiketi OLMAYAN modeller var. Olculdu:
+      stealth/space-bunny-alpha -> pricing.prompt=0, pricing.completion=0
+    Gercek fiyat katalogdan okunmalidir; bu yalnizca katalog bulunamazsa
+    kullanilan temkinli yedek yontemdir.
     """
     mid = (model_id or "").strip().lower()
     if not mid:
@@ -867,11 +864,43 @@ def _is_paid_model(model_id: str) -> bool:
     return not (mid.endswith(":free") or mid.endswith("/free"))
 
 
-def _paid_fallbacks_blocked() -> list[str]:
-    """Config'te olup da ucretsiz olmadigi icin zincire alinmayanlar."""
+def _model_is_free(model_id: str, catalog: dict | None = None) -> bool:
+    """Model gercekten ucretsiz mi? ONCE fiyat, sonra isim.
+
+    Sira onemli: bazi modeller ':free' etiketi olmadan da fiyati 0'dir
+    (space-bunny). Katalogda varsa GERCEK FIYAT esas alinir; katalogda yoksa
+    isim kuralina dusulur.
+    """
+    mid = (model_id or "").strip()
+    if not mid:
+        return False
+    if catalog is None:
+        catalog = {m.get("id"): m for m in (MODELS_CACHE.get("data") or [])
+                   if isinstance(m, dict) and m.get("id")}
+    entry = catalog.get(mid)
+    if isinstance(entry, dict):
+        return _is_free(entry)
+    return not _looks_paid_by_name(mid)
+
+
+def _is_paid_model(model_id: str, catalog: dict | None = None) -> bool:
+    """Model ucretli mi? Katalog fiyati > isim kurali.
+
+    Neden katalog onceligi: yedek zincire ucretli model girerse gateway onu
+    OTOMATIK cagirir ve kullanici istemeden fatura olusur. Ama tersi de var:
+    gercekten ucretsiz ama ':free' etiketi olmayan modeleri de yanlislikla
+    kesmemek gerekir. Onceden sadece isme bakiliyordu ve space-bunny gibi
+    bedava modeller yanlislikla ucretli sayiliyordu.
+    """
+    return not _model_is_free(model_id, catalog)
+
+
+def _paid_fallbacks_blocked(catalog: dict | None = None) -> list[str]:
+    """Config'te olup da ucretli oldugu icin zincire alinmayanlar."""
     if CONFIG.get("allow_paid_fallbacks", False):
         return []
-    return [m for m in (CONFIG.get("fallback_models") or []) if _is_paid_model(m)]
+    return [m for m in (CONFIG.get("fallback_models") or [])
+            if _is_paid_model(m, catalog)]
 
 
 async def _candidate_models(model: str | None) -> list[str]:
@@ -879,10 +908,11 @@ async def _candidate_models(model: str | None) -> list[str]:
     Yedekler once config'deki 'fallback_models'dan, sonra OpenRouter'un
     ucretsiz listesinden dinamik cekilir. Atria modunda (1) yedek uretilmez.
 
-    GUVENLIK: yedek zincire UCRETSIZ olmayan model girmez. Kullanici
-    config.json'a ucretli model yazdiysa ve 'allow_paid_fallbacks' acik
-    degilse o model atlanir ve bir kez uyari yazilir. Aksi halde gateway
-    kullanici istemeden ucretli model cagirip fatura olusturur."""
+    GUVENLIK: yedek zincire UCRETSIZ olmayan model girmez. Ucretsizlik
+    OpenRouter katalogundaki GERCEK FIYATLA belirlenir; ':free' etiketi
+    olmayan bedava modeller de gecer. Kullanici config.json'a ucretli model
+    yazdiysa ve 'allow_paid_fallbacks' acik degilse o model atlanir ve bir
+    kez uyari yazilir."""
     primary = model or get_active_model()
     if get_active_mode() == "1":
         return [primary]
@@ -890,18 +920,20 @@ async def _candidate_models(model: str | None) -> list[str]:
     if not CONFIG.get("auto_model_fallback", True):
         return cands
     limit = max(1, int(CONFIG.get("max_model_fallbacks", 4)))
-    blocked = _paid_fallbacks_blocked()
+    try:
+        raw = await fetch_openrouter_models()
+    except Exception:
+        raw = []
+    catalog = {m.get("id"): m for m in raw
+               if isinstance(m, dict) and m.get("id")}
+    blocked = _paid_fallbacks_blocked(catalog)
     if blocked:
         print(f"[ox-gateway] UYARI: fallback_models icindeki ucretli modeller "
               f"zincire ALINMADI (allow_paid_fallbacks: false): "
               f"{', '.join(blocked[:4])}")
     extra: list[str] = [m for m in (CONFIG.get("fallback_models") or [])
-                       if m not in blocked]
-    try:
-        raw = await fetch_openrouter_models()
-        extra += [m.get("id", "") for m in raw if _is_free(m)]
-    except Exception:
-        pass
+                        if m not in blocked]
+    extra += [mid for mid, e in catalog.items() if _is_free(e)]
     seen = {primary}
     for m in extra:
         m = (m or "").strip()

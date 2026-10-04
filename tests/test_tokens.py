@@ -375,12 +375,40 @@ class TestPaidFallbackGuard(unittest.IsolatedAsyncioTestCase):
             with self.subTest(model=m):
                 self.assertFalse(gateway._is_paid_model(m))
 
-    def test_unknown_model_is_treated_as_paid(self):
-        """Belirsiz olan ucretli sayilir - guvenli taraf."""
-        for m in ("deepseek/deepseek-v4-flash", "stealth/space-bunny-alpha",
-                  "openai/gpt-6-astra", ""):
+    def test_name_rule_flags_unknown_as_paid(self):
+        """Katalog YOKKEN temkinli davranis: isimde :free yoksa ucretli.
+
+        Bu bir yedek yontem; asil kural fiyattir (asagida).
+        """
+        for m in ("deepseek/deepseek-v4-flash", "openai/gpt-6-astra", ""):
             with self.subTest(model=m):
-                self.assertTrue(gateway._is_paid_model(m))
+                self.assertTrue(gateway._looks_paid_by_name(m))
+
+    def test_real_price_beats_name(self):
+        """':free' etiketi OLMAYAN bedava model gercekten ucretsiz olmali.
+
+        Olculdu: stealth/space-bunny-alpha -> pricing.prompt=0,
+        pricing.completion=0. Onceki kod isme baktigi icin bunu ucretli
+        sayiyordu.
+        """
+        cat = {"stealth/space-bunny-alpha": {
+            "id": "stealth/space-bunny-alpha",
+            "pricing": {"prompt": "0", "completion": "0"}}}
+        self.assertFalse(gateway._is_paid_model(
+            "stealth/space-bunny-alpha", cat),
+            "fiyati 0 olan model ucretli sayilmamali")
+        self.assertTrue(gateway._looks_paid_by_name("stealth/space-bunny-alpha"),
+                        "isim kurali bunu yanlis bulurdu - katalog duzeltir")
+
+    def test_paid_model_in_catalog_still_blocked(self):
+        cat = {"deepseek/deepseek-v4-flash": {
+            "id": "deepseek/deepseek-v4-flash",
+            "pricing": {"prompt": "0.0000002", "completion": "0.000000056"}}}
+        self.assertTrue(gateway._is_paid_model("deepseek/deepseek-v4-flash", cat))
+
+    def test_model_absent_from_catalog_falls_back_to_name(self):
+        self.assertFalse(gateway._is_paid_model("vendor/x:free", {}))
+        self.assertTrue(gateway._is_paid_model("vendor/x", {}))
 
     def test_paid_fallback_listed_as_blocked(self):
         gateway.CONFIG["allow_paid_fallbacks"] = False
