@@ -957,7 +957,7 @@ def _paid_fallbacks_blocked(catalog: dict | None = None) -> list[str]:
             if _is_paid_model(m, catalog)]
 
 
-async def _candidate_models(model: str | None) -> list[str]:
+async def _candidate_models(model: str | None, strict: bool = False) -> list[str]:
     """Birincil model + 429 durumunda denenecek ucretsiz yedek modeller.
     Yedekler once config'deki 'fallback_models'dan, sonra OpenRouter'un
     ucretsiz listesinden dinamik cekilir. Atria modunda (1) yedek uretilmez.
@@ -966,8 +966,26 @@ async def _candidate_models(model: str | None) -> list[str]:
     OpenRouter katalogundaki GERCEK FIYATLA belirlenir; ':free' etiketi
     olmayan bedava modeller de gecer. Kullanici config.json'a ucretli model
     yazdiysa ve 'allow_paid_fallbacks' acik degilse o model atlanir ve bir
-    kez uyari yazilir."""
-    primary = model or get_active_model()
+    kez uyari yazilir.
+
+    strict=True (istemci 'default' takma adini kullandiginda):
+      - SADECE secili model denenir, BASKA MODELLE KEDEYE GECILMEZ.
+        Kullanici "dashboard'daki modeli konus" dediyse sessizce nemotron'a
+        dusmek yanlis olur (boyle bir durum yasandi: 65 kez sessiz dusus).
+      - Ayni model config.retry_same_model kadar TEKRAR denenir; sonunda
+        hata istemciye dogrudan gider. Liste ayni modelin tekrarlarindan
+        olustugu icin mevcut dongu ek kod olmadan calisir.
+    """
+    primary = _resolve_model_alias(model)
+    if strict:
+        try:
+            extra = max(0, int(CONFIG.get("retry_same_model", 2)))
+        except (TypeError, ValueError):
+            extra = 2
+        if extra:
+            print(f"[ox-gateway] strict (default) mod: '{primary}' {extra} kez daha "
+                  f"denenecek, yedek modele gecilmeyecek")
+        return [primary] * (1 + extra)
     if get_active_mode() == "1":
         return [primary]
     cands = [primary]
@@ -1181,7 +1199,7 @@ async def open_atria_stream(anth_payload: dict, model: str | None = None):
     raise HTTPException(status_code=502, detail=f"Atria stream basarisiz. Son hata: {last_err}")
 
 
-async def call_openrouter(payload: dict, model: str | None = None) -> dict:
+async def call_openrouter(payload: dict, model: str | None = None, strict: bool = False) -> dict:
     """Istegi havuzdan key alarak OpenRouter'a yollar.
     Hata verirse agente hata gondermeden KENDI ICINDE duzeltir:
     1) Key failover, 2) model fallback (429), 3) parametre sadelestirme (4xx),
@@ -1207,7 +1225,7 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
 
     for rnd in range(rounds):
         for vbase in variants:
-            for m in await _candidate_models(primary):
+            for m in await _candidate_models(primary, strict):
                 # Kirpilan turda ayni modeli, katlanmis token butcesiyle tekrar dene
                 cur_base = vbase
                 degenerate = False
@@ -1312,7 +1330,7 @@ async def call_openrouter(payload: dict, model: str | None = None) -> dict:
     raise HTTPException(status_code=502, detail=f"Tum keyler/modeller basarisiz. Son hata: {last_err}")
 
 
-async def open_stream(payload: dict, model: str | None = None, pool=None):
+async def open_stream(payload: dict, model: str | None = None, pool=None, strict: bool = False):
     """Streaming icin upstream baglantisi acar.
     Hata verirse agente hata akitmamak icin kendi icinde duzeltir:
     key failover -> model fallback (429) -> parametre sadelestirme (4xx)
@@ -1330,7 +1348,7 @@ async def open_stream(payload: dict, model: str | None = None, pool=None):
 
     for rnd in range(rounds):
         for vbase in variants:
-            for m in await _candidate_models(primary):
+            for m in await _candidate_models(primary, strict):
                 payload_m = {**vbase, "model": m}
                 tried: set[str] = set()
                 bad_payload = False
@@ -2321,7 +2339,11 @@ async def anthropic_messages(request: Request):
     except Exception:
         raise HTTPException(400, "Gecersiz JSON")
 
-    model = _resolve_model_alias(body.get("model"))
+    raw_model = body.get("model")
+    # 'default' takma adi: SADECE dashboard'daki model konusulur, yedek modele
+    # sessizce gecilmez; ayni model retry_same_model kadar tekrar denenir.
+    strict = _is_default_alias(raw_model)
+    model = _resolve_model_alias(raw_model)
     # ---- Atria: Anthropic format dogrudan gider, ceviri yok (aktif mod 1 veya model Atria ise) ----
     if _should_route_atria(model):
         stall_s = max(5.0, float(CONFIG.get("stall_timeout", 45)))
@@ -2393,7 +2415,7 @@ async def anthropic_messages(request: Request):
             # olursa ASGI cokmesin diye graceful kapanis yapar.
             try:
                 client, resp, line_iter, first_line = await open_stream(
-                    {**payload, "model": cand_model}, cand_model)
+                    {**payload, "model": cand_model}, cand_model, strict=strict)
             except Exception as e:
                 raise _RetryableUpstream(
                     f"upstream baglantisi kurulamadi ({type(e).__name__})") from e
@@ -2662,7 +2684,7 @@ async def anthropic_messages(request: Request):
             # sey gondermeden basarisiz olursa (_RetryableUpstream) siradaki
             # modele geceriz. message_start ertelendigi icin bu guvenli.
             # Tum modeller bos/error donerse TEK bir hata event'i uretilir.
-            cands = await _candidate_models(model)
+            cands = await _candidate_models(model, strict)
             last_err: str | None = None
             last_model: str | None = None
             attempts = 0
@@ -2716,7 +2738,7 @@ async def anthropic_messages(request: Request):
         )
 
     # ---- Normal ----
-    result = await call_openrouter(payload, model)
+    result = await call_openrouter(payload, model, strict)
     msg = result["choices"][0]["message"]
     blocks = _openai_to_anthropic_blocks(msg)
     u = result.get("usage", {})
@@ -2852,6 +2874,33 @@ def _default_variants() -> dict:
     }
 
 
+def _model_tier(m: dict) -> int:
+    """Model listesindeki siralamasi icin kademe (kucuk = once).
+
+    Istenen siralama:
+      0) stealth modelleri  (space-bunny gibi; etiket: ':free' YOK)
+      1) ':free' etiketi olmayan ama fiyati 0 olan bedava modeller
+      2) ':free' etiketli modeller
+      3) ucretli modeller (en sona)
+    Neden stealth en onde: kullanici o modeli tercih ediyor ve zaten aktif
+    olan da o; katalog alfabetik geldigi icin gormezden gelirdi.
+    """
+    mid = str(m.get("id") or "").lower()
+    if "stealth" in mid:
+        return 0
+    if mid.endswith(":free") or mid.endswith("/free"):
+        return 2
+    # etiketsiz: gercek fiyat 0 mi diye bak
+    try:
+        pr = m.get("pricing") or {}
+        if float(pr.get("prompt", 1) or 0) == 0 and \
+                float(pr.get("completion", 1) or 0) == 0:
+            return 1
+    except (TypeError, ValueError):
+        pass
+    return 3
+
+
 async def models_payload() -> dict:
     default = get_active_model()
     # "default" sabit secenek: istemci tarafinda model secmeye gerek kalmasin.
@@ -2875,22 +2924,24 @@ async def models_payload() -> dict:
                            {"id": default, "name": f"⭐ {default} (varsayılan)",
                             "free": False, "default": True, **base_opts}]}
     raw = await fetch_openrouter_models()
+    by_id = {m.get("id"): m for m in raw if isinstance(m, dict) and m.get("id")}
     items = [
         {
             "id": m["id"],
             "name": m.get("name", m["id"]),
             "free": _is_free(m),
             "context": m.get("context_length"),
+            "paid": _is_paid_model(m["id"], by_id),
         }
         for m in raw
         if isinstance(m, dict) and m.get("id")
     ]
-    items.sort(key=lambda x: x["name"].lower())
-    free_first = [m for m in items if m["free"]] + [m for m in items if not m["free"]]
+    # SIRALAMA: stealth -> :free etiketsiz ama bedava -> :free etiketli
+    items.sort(key=lambda x: (_model_tier(by_id.get(x["id"], {})), x["name"].lower()))
     ordered = [default_entry,
                {"id": default, "name": f"⭐ {default} (varsayılan)",
                 "free": False, "default": True, **base_opts}] + \
-              [m for m in free_first if m["id"] != default]
+              [m for m in items if m["id"] != default]
     # Modele ozel thinking ayarini her modelle birlikte dondur: dashboard
     # model listesinden yaninda effort secici gosterebilsin.
     per = CONFIG.get("reasoning_effort_by_model") or {}
@@ -2991,6 +3042,7 @@ async def chat_completions(request: Request, req: ChatRequest):
     # ---- Streaming (SSE) ----
     if req.stream:
         # "default" takma adi -> anlik aktif model (dashboard'dan secilen)
+        strict = _is_default_alias(req.model)
         req_model = _resolve_model_alias(req.model)
         # Atria SSE -> OpenAI SSE cevirisi (aktif mod 1 veya model Atria ise)
         if _should_route_atria(req_model):
@@ -3101,7 +3153,7 @@ async def chat_completions(request: Request, req: ChatRequest):
             # Response baslamadan once hata cikabilir; HTTPException firlatmak
             # yerine OpenAI-uyumlu error chunk'i + [DONE] akiyoruz.
             try:
-                client, resp, line_iter, first_line = await open_stream(payload, req_model)
+                client, resp, line_iter, first_line = await open_stream(payload, req_model, strict=strict)
             except Exception:
                 # Hata asla istemciye hata olarak iletilmez: gecerli minimal akis
                 for chunk in _openai_graceful_chunks():

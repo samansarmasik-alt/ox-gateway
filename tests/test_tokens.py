@@ -442,6 +442,78 @@ class TestBudgetToEffortMapping(unittest.TestCase):
             {"effort": "medium"})
 
 
+class TestModelTierOrdering(unittest.TestCase):
+    """Model listesi siralamasi: stealth -> etiketsiz bedava -> :free -> ucretli.
+
+    Istenen sira (kullanici): yildizli/stealth en ustte, altinda ':free'
+    etiketi olmayan ama fiyati 0 olanlar, devaminda ':free' etiketliler.
+    """
+    M = {"id": "stealth/space-bunny-alpha", "pricing": {"prompt": "0", "completion": "0"}}
+    ETIKETSIZ = {"id": "inclusionai/ling-3.1-flash",
+                 "pricing": {"prompt": "0", "completion": "0"}}
+    ETIKETLI = {"id": "dots-studio/dots-3-note-preview:free",
+                "pricing": {"prompt": "0", "completion": "0"}}
+    UCRETLI = {"id": "aion-labs/aion-3.5",
+               "pricing": {"prompt": "0.000002", "completion": "0.000008"}}
+
+    def test_tiers_in_requested_order(self):
+        self.assertEqual(gateway._model_tier(self.M), 0)
+        self.assertEqual(gateway._model_tier(self.ETIKETSIZ), 1)
+        self.assertEqual(gateway._model_tier(self.ETIKETLI), 2)
+        self.assertEqual(gateway._model_tier(self.UCRETLI), 3)
+
+    def test_stealth_wins_even_with_free_suffix(self):
+        m = {"id": "vendor/stealth-x:free", "pricing": {"prompt": "0", "completion": "0"}}
+        self.assertEqual(gateway._model_tier(m), 0)
+
+    def test_openrouter_free_is_tagged_tier(self):
+        self.assertEqual(gateway._model_tier(
+            {"id": "openrouter/free", "pricing": {"prompt": "0", "completion": "0"}}), 2)
+
+    def test_missing_pricing_is_treated_as_paid(self):
+        self.assertEqual(gateway._model_tier({"id": "vendor/x"}), 3)
+
+
+class TestStrictDefaultNoFallback(unittest.IsolatedAsyncioTestCase):
+    """'default' seciliyken FALLBACK yapilmaz; ayni model tekrar denenir."""
+
+    def setUp(self):
+        self._pm = gateway.CONFIG.get("provider_models")
+        self._retry = gateway.CONFIG.get("retry_same_model")
+        gateway.CONFIG.setdefault("provider_models", {})
+        gateway.CONFIG["provider_models"]["2"] = "stealth/space-bunny-alpha"
+        gateway.CONFIG["retry_same_model"] = 2
+
+    def tearDown(self):
+        for k, v in (("provider_models", self._pm), ("retry_same_model", self._retry)):
+            if v is None:
+                gateway.CONFIG.pop(k, None)
+            else:
+                gateway.CONFIG[k] = v
+
+    async def test_strict_returns_only_same_model_repeated(self):
+        cands = await gateway._candidate_models("default", strict=True)
+        self.assertEqual(cands, ["stealth/space-bunny-alpha"] * 3)
+
+    async def test_strict_never_contains_other_model(self):
+        cands = await gateway._candidate_models("default", strict=True)
+        self.assertEqual(set(cands), {"stealth/space-bunny-alpha"})
+        self.assertNotIn("nvidia/nemotron-3.5-lightning:free", cands)
+
+    async def test_retry_count_configurable(self):
+        gateway.CONFIG["retry_same_model"] = 0
+        self.assertEqual(len(await gateway._candidate_models("default", strict=True)), 1)
+        gateway.CONFIG["retry_same_model"] = 4
+        self.assertEqual(len(await gateway._candidate_models("default", strict=True)), 5)
+
+    async def test_non_strict_still_falls_back(self):
+        """Gercek model adi verilmisse mevcut yedek davranisi degismez."""
+        gateway.CONFIG["max_model_fallbacks"] = 3
+        cands = await gateway._candidate_models("stealth/space-bunny-alpha")
+        self.assertEqual(cands[0], "stealth/space-bunny-alpha")
+        self.assertEqual(len(cands), 3)
+
+
 class TestDefaultModelAlias(unittest.TestCase):
     """"default" takma adi -> anlik aktif model.
 

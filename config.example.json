@@ -39,5 +39,6 @@
   "reasoning_effort": "high",
   "allow_paid_fallbacks": false,
   "reasoning_budget_to_effort": true,
-  "retry_sleep_ms": 250
+  "retry_sleep_ms": 250,
+  "retry_same_model": 2
 }
