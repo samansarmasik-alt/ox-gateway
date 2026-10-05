@@ -442,6 +442,58 @@ class TestBudgetToEffortMapping(unittest.TestCase):
             {"effort": "medium"})
 
 
+class TestPerModelRateLimitCooldown(unittest.TestCase):
+    """429 cooldown'u MODELE OZEL olmali.
+
+    OpenRouter free tier 429'u modelin gunluk limitidir; anahtar diger
+    modellerde saglamdir. Once anahtar GLOBAL isaretleniyordu: tek modelin
+    limiti 11 anahtarin hepsini kesip butun modellerin limitli gorunmesine
+    yol aciyordu ("tum modellerde gunluk sinira takildi").
+    """
+
+    def setUp(self):
+        self.pool = gateway.KeyPool(["k1", "k2", "k3"], cooldown=3.0,
+                                    cooldown_every=999, rest_seconds=0)
+
+    def test_429_benches_only_that_model(self):
+        self.pool.mark_rate_limited("k1", 600.0, "model-a")
+        self.assertIn("k1", self.pool._available("model-b"),
+                      "baska model icin anahtar kullanilabilir olmali")
+
+    def test_429_blocks_the_same_model(self):
+        self.pool.mark_rate_limited("k1", 600.0, "model-a")
+        self.assertNotIn("k1", self.pool._available("model-a"))
+
+    def test_other_keys_available_for_same_model(self):
+        self.pool.mark_rate_limited("k1", 600.0, "model-a")
+        avail = self.pool._available("model-a")
+        self.assertIn("k2", avail)
+        self.assertIn("k3", avail)
+
+    def test_mark_ok_clears_model_cooldown(self):
+        self.pool.mark_rate_limited("k1", 600.0, "model-a")
+        self.pool.mark_ok("k1", "model-a")
+        self.assertIn("k1", self.pool._available("model-a"))
+
+    def test_all_keys_limited_for_one_model_still_listed(self):
+        """Tum anahtarlar o model icin limitliyse havuz bos donmemeli."""
+        for k in ("k1", "k2", "k3"):
+            self.pool.mark_rate_limited(k, 600.0, "model-a")
+        self.assertEqual(len(self.pool._available("model-a")), 3)
+
+    def test_global_cooldown_still_applies_without_model(self):
+        """model verilmediginde eski global davranis korunur."""
+        self.pool.mark_rate_limited("k1", 600.0, None)
+        self.assertNotIn("k1", self.pool._available("model-a"))
+        self.assertNotIn("k1", self.pool._available("model-b"))
+
+    def test_generic_failure_still_global(self):
+        """429 disi hata (500 vb.) anahtari tum modellerde devre disi birakir."""
+        self.pool.mark_failed("k1")
+        self.assertNotIn("k1", self.pool._available("model-a"))
+        self.assertNotIn("k1", self.pool._available("model-b"))
+
+
 class TestModelTierOrdering(unittest.TestCase):
     """Model listesi siralamasi: stealth -> etiketsiz bedava -> :free -> ucretli.
 

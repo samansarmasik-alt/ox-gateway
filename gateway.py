@@ -342,6 +342,11 @@ class KeyPool:
         self._every = max(1, int(cooldown_every))
         self._rest = min(max(0.0, rest_seconds), MAX_COOLDOWN_S)
         self._cooldown_until: dict[str, float] = {}
+        # MODELE OZEL 429 cooldown'u. OpenRouter'in ucretsiz tier 429'u bir
+        # MODELIN gunluk limitidir; anahtar diger modellerde saglamdir.
+        # Once anahtar global olarak isaretleniyordu: tek modelin limiti
+        # 11 anahtarin hepsini kesip "tum modellerde gunluk sinir" yaziyordu.
+        self._model_cooldown: dict[tuple, float] = {}
         self._stats: dict[str, dict] = {k: _new_stats() for k in self._keys}
         self._rr = itertools.cycle(range(len(self._keys))) if self._keys else None
         self._lock = asyncio.Lock()
@@ -377,21 +382,38 @@ class KeyPool:
             return True
         return False
 
-    def _available(self) -> list[str]:
+    def _available(self, model: str | None = None) -> list[str]:
         now = time.monotonic()
-        avail = [k for k in self._keys if self._cooldown_until.get(k, 0) <= now]
+        avail = [k for k in self._keys
+                 if self._cooldown_until.get(k, 0) <= now
+                 and self._model_cooldown.get((k, model), 0) <= now]
         return avail or list(self._keys)
 
-    def mark_ok(self, key: str):
+    def mark_ok(self, key: str, model: str | None = None):
         self._cooldown_until.pop(key, None)
+        if model:
+            self._model_cooldown.pop((key, model), None)
 
     def mark_failed(self, key: str):
         self._cooldown_until[key] = time.monotonic() + self._cooldown
 
-    def mark_rate_limited(self, key: str, seconds: float):
-        """429 gibi durumlarda; gunluk limit icin MAX_RATE_LIMIT_COOLDOWN_S'a kadar tutar."""
-        self._cooldown_until[key] = time.monotonic() + min(
-            max(self._cooldown, seconds), MAX_RATE_LIMIT_COOLDOWN_S)
+    def mark_rate_limited(self, key: str, seconds: float,
+                          model: str | None = None):
+        """429 gibi durumlarda.
+
+        ONCE anahtar global olarak isaretleniyordu; oysa free tier 429'u
+        modele ozeldir. Global isaretleme, tek bir modelin gunluk limiti
+        tum havuzu devre disi birakip butun modellerin limitli gorunmesine
+        yol aciyordu. Artik (key, model) ikilisi isaretlenir; anahtara yalniz
+        kisa bir ek bekleme konur.
+        """
+        secs = min(max(0.0, seconds), MAX_RATE_LIMIT_COOLDOWN_S)
+        if model:
+            # SADECE bu model icin gecici. Anahtara global isaret konmaz;
+            # aksi halde bu modelin limiti diger tum modelleri de kesiyordu.
+            self._model_cooldown[(key, model)] = time.monotonic() + secs
+        else:
+            self._cooldown_until[key] = time.monotonic() + secs
 
     def record(self, key: str, ms: float, ok: bool):
         s = self._stats.setdefault(key, _new_stats())
@@ -406,11 +428,18 @@ class KeyPool:
             s["uses_since_rest"] = 0
             self._cooldown_until[key] = time.monotonic() + self._rest
 
-    async def acquire(self, skip: set[str] | None = None) -> str | None:
-        """Musait tum keylere ESIT round-robin dagitim; failover icin skip kullanilir."""
+    async def acquire(self, skip: set[str] | None = None,
+                      model: str | None = None) -> str | None:
+        """Musait tum keylere ESIT round-robin dagitim; failover icin skip kullanilir.
+
+        model verildiginde o model icin 429 almis keyler atlanir (anahtarin
+        diger modellerdeki durumu bozulmaz).
+        """
         async with self._lock:
             skip = skip or set()
-            cands = [k for k in self._available() if k not in skip]
+            cands = [k for k in self._available(model) if k not in skip]
+            if not cands:
+                cands = [k for k in self._keys if k not in skip]
             if not cands:
                 return None
             if self._rr is None:
@@ -489,18 +518,22 @@ def _timeouts() -> httpx.Timeout:
     )
 
 
-def _handle_upstream_failure(key: str, resp: httpx.Response, ms: float, pool=None):
-    """Upstream hata durumunu havuza isler; 429'da reset suresine bakilir
-    ve gunluk limitlerde MAX_RATE_LIMIT_COOLDOWN_S (1 saat) kadar cooldown uygulanir."""
+def _handle_upstream_failure(key: str, resp: httpx.Response, ms: float,
+                            pool=None, model: str | None = None):
+    """Upstream hata durumunu havuza isler; 429'da reset suresine bakilir.
+
+    429 cooldown'u MODELE OZEL uygulanir (bkz. KeyPool.mark_rate_limited):
+    free tier'da gunluk limit modele ozeldir, anahtara degil.
+    """
     p = pool or active_pool()
     p.record(key, ms, ok=False)
     if resp.status_code == 429:
         seconds = _rate_limit_reset_seconds(resp)
         if seconds is not None:
-            p.mark_rate_limited(key, min(seconds, MAX_RATE_LIMIT_COOLDOWN_S))
+            p.mark_rate_limited(key, seconds, model)
             return
         # 429 ama reset header yoksa — en az 60 sn dinlendir (free tier daily limit gibi)
-        p.mark_rate_limited(key, 60.0)
+        p.mark_rate_limited(key, 60.0, model)
         return
     p.mark_failed(key)
 
@@ -1096,7 +1129,7 @@ async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> 
     for rnd in range(rounds):
         tried: set[str] = set()
         for _ in range(max_retries):
-            key = await pool.acquire(skip=tried)
+            key = await pool.acquire(skip=tried, model=primary)
             if key is None:
                 break
             tried.add(key)
@@ -1108,7 +1141,7 @@ async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> 
                 ms = (time.perf_counter() - t0) * 1000
                 if resp.status_code == 200:
                     data = resp.json()
-                    pool.mark_ok(key)
+                    pool.mark_ok(key, primary)
                     pool.record(key, ms, ok=True)
                     if _anthropic_turn_is_empty(data) and budget_tries > 0:
                         budget_tries -= 1
@@ -1119,7 +1152,7 @@ async def call_atria_anthropic(anth_payload: dict, model: str | None = None) -> 
                         continue
                     return data
                 last_err = f"atria:{primary} -> HTTP {resp.status_code}: {resp.text[:300]}"
-                _handle_upstream_failure(key, resp, ms, pool)
+                _handle_upstream_failure(key, resp, ms, pool, primary)
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
                     break
             except httpx.HTTPError as e:
@@ -1155,7 +1188,7 @@ async def open_atria_stream(anth_payload: dict, model: str | None = None):
     last_err = None
     tried: set[str] = set()
     for _ in range(max_retries):
-        key = await pool.acquire(skip=tried)
+        key = await pool.acquire(skip=tried, model=primary)
         if key is None:
             break
         tried.add(key)
@@ -1170,7 +1203,7 @@ async def open_atria_stream(anth_payload: dict, model: str | None = None):
                 last_err = f"atria:{primary} -> HTTP {resp.status_code}: {(await resp.aread()).decode()[:300]}"
                 await resp.aclose()
                 await client.aclose()
-                _handle_upstream_failure(key, resp, ms, pool)
+                _handle_upstream_failure(key, resp, ms, pool, primary)
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
                     break
                 continue
@@ -1186,7 +1219,7 @@ async def open_atria_stream(anth_payload: dict, model: str | None = None):
                 pool.record(key, ms, ok=False)
                 continue
             ms = (time.perf_counter() - t0) * 1000
-            pool.mark_ok(key)
+            pool.mark_ok(key, primary)
             pool.record(key, ms, ok=True)
             return client, resp, line_iter, first_line
         except httpx.HTTPError as e:
@@ -1236,7 +1269,7 @@ async def call_openrouter(payload: dict, model: str | None = None, strict: bool 
                     truncated = False
                     degenerate = False
                     for _ in range(max_retries):
-                        key = await pool.acquire(skip=tried)
+                        key = await pool.acquire(skip=tried, model=m)
                         if key is None:
                             break
                         tried.add(key)
@@ -1250,7 +1283,7 @@ async def call_openrouter(payload: dict, model: str | None = None, strict: bool 
                                                          headers=headers)
                             ms = (time.perf_counter() - t0) * 1000
                             if resp.status_code == 200:
-                                pool.mark_ok(key)
+                                pool.mark_ok(key, m)
                                 pool.record(key, ms, ok=True)
                                 data = resp.json()
                                 if _openai_turn_is_empty(data):
@@ -1271,7 +1304,7 @@ async def call_openrouter(payload: dict, model: str | None = None, strict: bool 
                                           f"/{len(variants)}")
                                 return data
                             last_err = f"{m} -> HTTP {resp.status_code}: {resp.text[:300]}"
-                            _handle_upstream_failure(key, resp, ms, pool)
+                            _handle_upstream_failure(key, resp, ms, pool, m)
                             if resp.status_code == 429:
                                 # Bu modelin gunluk limiti dolu -> sonraki modele gec
                                 print(f"[ox-gateway] '{m}' gunluk limite takildi, "
@@ -1353,7 +1386,7 @@ async def open_stream(payload: dict, model: str | None = None, pool=None, strict
                 tried: set[str] = set()
                 bad_payload = False
                 for _ in range(max_retries):
-                    key = await pool.acquire(skip=tried)
+                    key = await pool.acquire(skip=tried, model=m)
                     if key is None:
                         break
                     tried.add(key)
@@ -1369,7 +1402,7 @@ async def open_stream(payload: dict, model: str | None = None, pool=None, strict
                             last_err = f"{m} -> HTTP {resp.status_code}: {(await resp.aread()).decode()[:300]}"
                             await resp.aclose()
                             await client.aclose()
-                            _handle_upstream_failure(key, resp, ms, pool)
+                            _handle_upstream_failure(key, resp, ms, pool, m)
                             if resp.status_code == 429:
                                 print(f"[ox-gateway] stream: '{m}' gunluk limite takildi, yedek modele geciliyor")
                                 break
@@ -1396,7 +1429,7 @@ async def open_stream(payload: dict, model: str | None = None, pool=None, strict
                             continue
 
                         ms = (time.perf_counter() - t0) * 1000
-                        pool.mark_ok(key)
+                        pool.mark_ok(key, m)
                         pool.record(key, ms, ok=True)  # time-to-first-byte
                         if m != primary or vbase is not variants[0]:
                             print(f"[ox-gateway] stream: istek kendi icinde duzeltildi -> "
@@ -2417,8 +2450,12 @@ async def anthropic_messages(request: Request):
                 client, resp, line_iter, first_line = await open_stream(
                     {**payload, "model": cand_model}, cand_model, strict=strict)
             except Exception as e:
+                # Gercek sebebi koru (HTTP 429 = gunluk limit gibi). Sadece
+                # exception turunu yazmak kullanicya "baglanti kurulamadi"
+                # dediriyordu; oysa model gunluk limitteydi.
+                det = getattr(e, "detail", None) or str(e)
                 raise _RetryableUpstream(
-                    f"upstream baglantisi kurulamadi ({type(e).__name__})") from e
+                    f"upstream hatasi: {str(det)[:180]}") from e
             # thinking ve text icin AYRI bloklar; her tool_call da kendi blogunda
             block_type: str | None = None   # None | "thinking" | "text" | "tool_use"
             block_index = -1
@@ -2707,6 +2744,16 @@ async def anthropic_messages(request: Request):
             DIAG["empty_stream_turns"] = DIAG.get("empty_stream_turns", 0) + 1
             print(f"[ox-gateway] TUM MODELLER BASARISIZ ({len(cands)} deneme) "
                   f"-> error event. Son hata: {last_err}")
+            if strict:
+                # 'default' modunda tek model denendi; "tum modeller" demek
+                # yaniltici olurdu.
+                msg = (f"'{last_model}' {len(cands)} kez denendi ve basarisiz "
+                       f"oldu ({last_err}). 'default' seciliyken yedek modele "
+                       f"gecilmez; dashboard'dan baska bir model sec veya "
+                       f"opencode'da modeli dogrudan sec.")
+            else:
+                msg = (f"tum modellerden bos/hatali cevap geldi ({last_err}); "
+                       f"lutfen tekrar deneyin")
             _diag({
                 "path": "/v1/messages",
                 "mode": get_active_mode(),
@@ -2726,8 +2773,7 @@ async def anthropic_messages(request: Request):
                 "type": "error",
                 "error": {
                     "type": "api_error",
-                    "message": (f"tum modellerden bos/hatali cevap geldi "
-                                f"({last_err}); lutfen tekrar deneyin"),
+"message": msg,
                 },
             })
 
